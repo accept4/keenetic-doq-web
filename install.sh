@@ -8,7 +8,21 @@ NAME="doq-web"
 
 echo "=== keenetic-doq-web installer ==="
 
-# Определяем архитектуру
+# 1. Проверяем наличие Entware
+if [ ! -d "/opt/bin" ] && [ ! -d "/opt/sbin" ]; then
+    echo "Ошибка: Среда Entware не обнаружена в /opt!"
+    echo "Установите Entware на роутер перед запуском скрипта."
+    exit 1
+fi
+
+# 2. Проверяем утилиту curl
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Ошибка: curl не установлен!"
+    echo "Установите его командой: opkg update && opkg install curl"
+    exit 1
+fi
+
+# 3. Определяем архитектуру системы
 ARCH=$(uname -m)
 case "$ARCH" in
   aarch64|arm64)  BINARY="doq-web-linux-arm64" ;;
@@ -21,22 +35,25 @@ case "$ARCH" in
     ;;
 esac
 
-# Скачиваем бинарник из релизов
+# 4. Скачиваем бинарник из последней версии GitHub Releases
 TMP="/tmp/$BINARY"
 URL="https://github.com/$REPO/releases/latest/download/$BINARY"
 
 echo "Скачиваю $BINARY ..."
 curl -fsSL -o "$TMP" "$URL" || {
   echo "Ошибка: Не удалось скачать $BINARY."
-  echo "Убедитесь, что в GitHub Releases выложен скомпилированный файл с таким именем."
+  echo "Проверьте интернет-соединение и наличие скомпилированного файла в GitHub Releases."
   exit 1
 }
 
+# 5. Устанавливаем бинарный файл
+mkdir -p "$BIN_DIR"
 chmod +x "$TMP"
 mv "$TMP" "$BIN_DIR/$NAME"
 echo "Установлен бинарник: $BIN_DIR/$NAME"
 
-# Создаем init-скрипт для Entware (rc.unslung)
+# 6. Создаем службу автозапуска для Entware (rc.unslung)
+mkdir -p "$INIT_DIR"
 cat > "$INIT_DIR/S57doq-web" << 'EOF'
 #!/bin/sh
 
@@ -52,15 +69,16 @@ EOF
 
 chmod +x "$INIT_DIR/S57doq-web"
 
-# Запускаем службу
-"$INIT_DIR/S57doq-web" start
+# 7. Запускаем сервис
+echo "Запускаю службу..."
+"$INIT_DIR/S57doq-web" start || true
 
-# Определяем IP-адрес роутера в локальной сети
+# 8. Определяем локальный IP-адрес роутера
 IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP=$(ip -4 addr show br1 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
-[ -z "$IP" ] && IP="IP-роутера"
+[ -z "$IP" ] && IP="<IP-роутера>"
 
 echo ""
-echo "Установка успешно завершена!"
+echo "=== Установка успешно завершена! ==="
 echo "Веб-интерфейс доступен по адресу: http://$IP:8088"
 echo ""
