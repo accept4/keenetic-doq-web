@@ -4,7 +4,7 @@
 
 ## Установка
 
-curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/install.sh | tr -d '\r' | sh
+curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/install.sh | sh
 ## Удаление
 
 curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/uninstall.sh | tr -d '\r' | sh
