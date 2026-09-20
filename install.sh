@@ -1,3 +1,5 @@
+
+sh
 #!/bin/sh
 set -e
 
