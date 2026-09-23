@@ -9,4 +9,4 @@ curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/insta
 
 curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/uninstall.sh | sh
 
-Открыть: http://IP-роутера:8088
+Открыть: http://IP-роутера:8090
