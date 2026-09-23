@@ -80,5 +80,5 @@ IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 
 echo ""
 echo "=== Установка успешно завершена! ==="
-echo "Веб-интерфейс доступен по адресу: http://$IP:8088"
+echo "Веб-интерфейс доступен по адресу: http://$IP:8090"
 echo ""
