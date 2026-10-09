@@ -1,0 +1,12 @@
+# Рабочее дерево на Windows по умолчанию получает CRLF (core.autocrlf=true).
+# Для проекта, который копируют на роутер, это ловушка: install.sh с CRLF
+# даёт "bad interpreter: /bin/sh^M". Shell-скрипты и конфиги принудительно LF.
+*.sh    text eol=lf
+*.go    text eol=lf
+*.mod   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+*.md text auto
