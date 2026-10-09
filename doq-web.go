@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -123,9 +124,45 @@ func run(name string, args ...string) string {
 		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
 	}
 	if err != nil {
-		return fmt.Sprintf("Ошибка: %v\n%s", err, string(out))
+		return fmt.Sprintf("Ошибка: %v\n%s", err, stripANSI(string(out)))
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(stripANSI(string(out)))
+}
+
+// ansiSequence — экранные sequence вида ESC [ <параметры> <финал>, которыми
+// rc.func из Entware красит «done.». Финальный байт CSI — в диапазоне @-~
+// (m для SGR), параметры — цифры и ';'. Литерал '[' записан классом [[]
+// чтобы не экранировать скобку.
+var ansiSequence = regexp.MustCompile("\x1b[[][0-9;]*[@-~]")
+
+// stripANSI вырезает цветовые sequence из вывода. Без этого page() гонит их
+// через html.EscapeString, который съедает байт ESC и оставляет на экране
+// мусор: «Restart: [1;37m Shutting down doqd... [m [1;32m done. [m».
+//
+// Заодно снимаются \r (rc.func на части прошивок печатает CRLF) и хвост
+// sequence, оборванного усечением буфера на maxOutput: после ReplaceAllString
+// любой оставшийся ESC по построению незавершён.
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, 0x1b) {
+		return strings.ReplaceAll(s, "\r", "")
+	}
+	s = ansiSequence.ReplaceAllString(s, "")
+	if i := strings.LastIndexByte(s, 0x1b); i >= 0 {
+		s = s[:i]
+	}
+	return strings.ReplaceAll(s, "\r", "")
+}
+
+// controlOutput форматирует вывод init-скриптов (restart/stop/start): rc.func
+// набивает «done.» длинными отступами, и в msg вырастает простыня пробелов.
+// Схлопывание пробелов применяется ТОЛЬКО здесь — «doqd list» печатает
+// таблицу, у которой выравнивание по колонкам важнее экономии места.
+func controlOutput(s string) string {
+	lines := strings.Split(stripANSI(s), "\n")
+	for i, ln := range lines {
+		lines[i] = strings.Join(strings.Fields(ln), " ")
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 func main() {
@@ -240,19 +277,19 @@ func test(w http.ResponseWriter, r *http.Request) {
 }
 
 func restart(w http.ResponseWriter, r *http.Request) {
-	out := run("/opt/etc/init.d/S56doqd", "restart")
+	out := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Restart:\n"+out), 303)
 }
 
 func stop(w http.ResponseWriter, r *http.Request) {
-	out := run("/opt/etc/init.d/S56doqd", "stop")
+	out := controlOutput(run("/opt/etc/init.d/S56doqd", "stop"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Stop:\n"+out), 303)
 }
 
 func start(w http.ResponseWriter, r *http.Request) {
-	out := run("/opt/etc/init.d/S56doqd", "start")
+	out := controlOutput(run("/opt/etc/init.d/S56doqd", "start"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Start:\n"+out), 303)
 }
@@ -365,7 +402,7 @@ func install(w http.ResponseWriter, r *http.Request) {
 	if len(out) > maxOutput {
 		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
 	}
-	text := strings.TrimSpace(string(out))
+	text := strings.TrimSpace(stripANSI(string(out)))
 	if err != nil {
 		if text != "" {
 			text += "\n"

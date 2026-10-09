@@ -260,3 +260,41 @@ func TestDomainASCII(t *testing.T) {
 		}
 	}
 }
+
+// Строка ровно как её печатает rc.func из Entware. Без stripANSI page()
+// прогоняет ESC через html.EscapeString и на экране остаётся
+// «[1;37m Shutting down doqd... [m [1;32m done. [m».
+func TestControlOutputStripsColor(t *testing.T) {
+	in := "\x1b[1;37m Shutting down doqd... \x1b[m            \x1b[1;32m done. \x1b[m"
+	want := "Shutting down doqd... done."
+	if got := controlOutput(in); got != want {
+		t.Errorf("controlOutput = %q, want %q", got, want)
+	}
+}
+
+// Многострочный вывод и кириллица должны пережить зачистку, а sequence,
+// оборванный усечением на maxOutput, обязан исчезнуть целиком — иначе
+// незакрытый ESC снова доедает html.EscapeString.
+func TestStripANSIMultilineAndBrokenTail(t *testing.T) {
+	in := "● running (pid 1234)\nапстрим \x1b[32mquic://dns.example.com\x1b[0m\n\x1b[1;3"
+	want := "● running (pid 1234)\nапстрим quic://dns.example.com\n"
+	if got := stripANSI(in); got != want {
+		t.Errorf("stripANSI = %q, want %q", got, want)
+	}
+}
+
+// controlOutput схлопывает отступы rc.func, но НЕ склеивает строки,
+// а stripANSI не трогает пробелы вовсе: «doqd list» печатает таблицу,
+// у неё выравнивание по колонкам — часть смысла.
+func TestControlOutputKeepsLinesAndListKeepsColumns(t *testing.T) {
+	in := "Установлен бинарник:   /opt/sbin/doq-web\n   rc.custom недоступен\n"
+	want := "Установлен бинарник: /opt/sbin/doq-web\nrc.custom недоступен"
+	if got := controlOutput(in); got != want {
+		t.Errorf("controlOutput = %q, want %q", got, want)
+	}
+
+	table := "1  quic://a.example.com  ok\n2  quic://b.example.com  timeout"
+	if got := stripANSI(table); got != table {
+		t.Errorf("stripANSI исказил таблицу: %q", got)
+	}
+}
