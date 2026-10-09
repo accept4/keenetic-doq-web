@@ -102,5 +102,6 @@ jobs:
             SHA256SUMS
           draft: ${{ github.event.inputs.draft }}
           generate_release_notes: true
+          overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
