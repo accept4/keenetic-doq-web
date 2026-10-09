@@ -104,15 +104,19 @@ EOF
 
 chmod +x "$INIT_DIR/S57doq-web"
 
-# 7. Добавляем автозапуск в rc.custom (KeeneticOS запускает этот скрипт при старте)
-# На KeeneticOS /opt/etc/init.d/ скрипты не запускаются автоматически —
-# нужен rc.custom хук, который вызывается ndm в процессе загрузки.
-if ! grep -q "S57doq-web" /flash/rc.custom 2>/dev/null; then
-    echo 'if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi' >> /flash/rc.custom
+# 7. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
+# На современных KeeneticOS /flash — read-only, и это не проблема: ndm при
+# монтировании раздела с /opt сам запускает скрипты /opt/etc/init.d/S*,
+# а S57doq-web создан на шаге 6. Неудачная запись не должна ронять
+# установку — на set -e перенаправление >> убило бы скрипт до запуска сервиса.
+RC_LINE='if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi'
+if grep -qs "S57doq-web" /flash/rc.custom 2>/dev/null; then
+    echo "Автозапуск в /flash/rc.custom уже существует"
+elif echo "$RC_LINE" >> /flash/rc.custom 2>/dev/null; then
     chmod +x /flash/rc.custom
     echo "Добавлен автозапуск в /flash/rc.custom"
 else
-    echo "Автозапуск в /flash/rc.custom уже существует"
+    echo "rc.custom недоступен (read-only) — автозапуск через /opt/etc/init.d/S57doq-web"
 fi
 
 # 8. Запускаем сервис
