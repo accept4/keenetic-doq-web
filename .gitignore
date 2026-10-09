@@ -1,0 +1,22 @@
+# Артефакты сборки — публикуются через GitHub Releases, не через git
+/dist/
+/doq-web-*
+!*.exe
+*.exe~
+
+# Бэкапы, создаваемые install.sh при обновлении
+*.bak
+
+# Локальные данные: кэш постов, сохранённый токен, конфиги
+data/
+token.json
+.env
+
+# Логи
+*.log
+
+# Системные файлы
+.vscode/
+.vs/
+Thumbs.db
+desktop.ini
