@@ -1,7 +1,7 @@
 # Артефакты сборки — публикуются через GitHub Releases, не через git
 /dist/
 /doq-web-*
-!*.exe
+/doq-web.exe
 *.exe~
 
 # Бэкапы, создаваемые install.sh при обновлении

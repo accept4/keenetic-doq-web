@@ -65,7 +65,7 @@ TMP="$BIN_DIR/$NAME.part"
 case "$TARGET" in
     aarch64-k3.10)    BINARY="doq-web-linux-arm64" ;;
     armv7sf-k3.2)     BINARY="doq-web-linux-arm" ;;
-    armv5sf-k3.2)     BINARY="doq-web-linux-arm" ;;
+    armv5sf-k3.2)     BINARY="doq-web-linux-armv5" ;;
     mipselsf-k3.4)    BINARY="doq-web-linux-mipsle" ;;
     mipssf-k3.4)      BINARY="doq-web-linux-mips" ;;
     x64-k3.2)         BINARY="doq-web-linux-amd64" ;;

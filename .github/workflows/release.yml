@@ -60,13 +60,45 @@ jobs:
           go build -trimpath -ldflags="-s -w" -o doq-web-linux-mipsle
           sha256sum doq-web-linux-mipsle >> SHA256SUMS
 
+      - name: Build Linux MIPS (softfloat, big-endian)
+        env:
+          GOOS: linux
+          GOARCH: mips
+          GOMIPS: softfloat
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips
+          sha256sum doq-web-linux-mips >> SHA256SUMS
+
+      - name: Build Linux ARM (v5)
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: 5
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o doq-web-linux-armv5
+          sha256sum doq-web-linux-armv5 >> SHA256SUMS
+
+      - name: Build Linux AMD64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o doq-web-linux-amd64
+          sha256sum doq-web-linux-amd64 >> SHA256SUMS
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             doq-web-linux-arm64
             doq-web-linux-arm
+            doq-web-linux-armv5
             doq-web-linux-mipsle
+            doq-web-linux-mips
+            doq-web-linux-amd64
             SHA256SUMS
           draft: ${{ github.event.inputs.draft }}
           generate_release_notes: true

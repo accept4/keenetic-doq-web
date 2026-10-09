@@ -19,6 +19,24 @@ go build -ldflags="-s -w" -o dist/doq-web-linux-mipsle .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mipsle"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mipsle"
 
+# linux/mips softfloat big-endian (Entware mipssf-k3.4)
+$env:GOARCH = "mips"; $env:GOMIPS = "softfloat"
+go build -ldflags="-s -w" -o dist/doq-web-linux-mips .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-mips"
+
+# linux/amd64 (Entware x64-k3.2, отладка на ПК)
+$env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:GOMIPS = ""
+go build -ldflags="-s -w" -o dist/doq-web-linux-amd64 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL amd64"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-amd64"
+
+# linux/arm GOARM=5 (Entware armv5sf-k3.2)
+$env:GOARCH = "arm"; $env:GOARM = "5"
+go build -ldflags="-s -w" -o dist/doq-web-linux-armv5 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL armv5"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-armv5"
+
 # windows/amd64
 $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:GOMIPS = ""; $env:GOARM = ""
 go build -ldflags="-s -w" -o dist/doq-web-windows-amd64.exe .
