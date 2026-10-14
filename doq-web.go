@@ -187,14 +187,21 @@ func commandAvailable(name string) error {
 	return err
 }
 
+// run — выполняет команду с таймаутом 3 секунды. Для долгих операций
+// используйте runWithTimeout().
 func run(name string, args ...string) string {
+	return runWithTimeout(name, 3*time.Second, args...)
+}
+
+// runWithTimeout — как run(), но с настраиваемым таймаутом.
+func runWithTimeout(name string, timeout time.Duration, args ...string) string {
 	if runtime.GOOS == "windows" {
 		return fmt.Sprintf("Ошибка: %s недоступен (на ПК нет doqd, это нормально)", name)
 	}
 	if err := commandAvailable(name); err != nil {
 		return fmt.Sprintf("Ошибка: %s недоступен (%v)", name, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
@@ -393,8 +400,13 @@ func geo(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode("doqd geo:\n"+out), 303)
 }
 
+// geoReselect переоценивает серверы обхода. По README апстрима команда
+// ждёт до 45 с, поэтому и таймаут процесса, и дедлайн записи ответа
+// подняты выше дефолтных 3 с и 20 с — иначе context убивал doqd на
+// середине переоценки ("signal: killed").
 func geoReselect(w http.ResponseWriter, r *http.Request) {
-	out := run("doqd", "geo", "reselect")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(70 * time.Second))
+	out := runWithTimeout("doqd", 60*time.Second, "geo", "reselect")
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("geo reselect:\n"+out), 303)
 }
