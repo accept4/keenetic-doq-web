@@ -271,7 +271,7 @@ func main() {
 	http.HandleFunc("/start", onlyPOST(start))
 	http.HandleFunc("/install", onlyPOST(install))
 	http.HandleFunc("/update", onlyPOST(update))
-	http.HandleFunc("/geo", geo)
+	http.HandleFunc("/geo", onlyPOST(geo))
 	http.HandleFunc("/geo-reselect", onlyPOST(geoReselect))
 	http.HandleFunc("/add-domain", onlyPOST(addDomain))
 	http.HandleFunc("/remove-domain", onlyPOST(removeDomain))
@@ -330,12 +330,25 @@ func page(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// addFlags — белый список флагов doqd add. Без него через подменённую
+// форму в exec можно было передать что угодно: exec.CommandContext не
+// знает про шелл, но произвольные аргументы doqd всё равно принимает.
+var addFlags = map[string]bool{
+	"--geo":      true,
+	"--fallback": true,
+	"--force":    true,
+}
+
 func add(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimSpace(r.FormValue("url"))
 	typ := strings.TrimSpace(r.FormValue("type"))
 	host, err := domainASCII(raw)
 	if err != nil {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+		return
+	}
+	if typ != "" && !addFlags[typ] {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: недопустимый тип"), 303)
 		return
 	}
 	var out string
@@ -373,10 +386,15 @@ func test(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode(out), 303)
 }
 
+// validDomain проверяет, что s — одиночный домен без схемы, пробелов и
+// спецсимволов (то, что принимает doqd add-domain). Флаги вида "--geo"
+// и инъекции аргументов сюда не проходят.
+var domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$`)
+
 func addDomain(w http.ResponseWriter, r *http.Request) {
 	domain := strings.TrimSpace(r.FormValue("domain"))
-	if domain == "" {
-		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустое значение"), 303)
+	if !domainRe.MatchString(domain) {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: некорректное имя домена"), 303)
 		return
 	}
 	out := run("doqd", "add-domain", domain)
@@ -386,8 +404,8 @@ func addDomain(w http.ResponseWriter, r *http.Request) {
 
 func removeDomain(w http.ResponseWriter, r *http.Request) {
 	domain := strings.TrimSpace(r.FormValue("domain"))
-	if domain == "" {
-		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустое значение"), 303)
+	if !domainRe.MatchString(domain) {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: некорректное имя домена"), 303)
 		return
 	}
 	out := run("doqd", "remove-domain", domain)
