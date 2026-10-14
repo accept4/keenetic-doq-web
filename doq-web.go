@@ -264,6 +264,10 @@ func main() {
 	http.HandleFunc("/start", onlyPOST(start))
 	http.HandleFunc("/install", onlyPOST(install))
 	http.HandleFunc("/update", onlyPOST(update))
+	http.HandleFunc("/geo", geo)
+	http.HandleFunc("/geo-reselect", onlyPOST(geoReselect))
+	http.HandleFunc("/add-domain", onlyPOST(addDomain))
+	http.HandleFunc("/remove-domain", onlyPOST(removeDomain))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -321,12 +325,18 @@ func page(w http.ResponseWriter, r *http.Request) {
 
 func add(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimSpace(r.FormValue("url"))
+	typ := strings.TrimSpace(r.FormValue("type"))
 	host, err := domainASCII(raw)
 	if err != nil {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
 		return
 	}
-	out := run("doqd", "add", host)
+	var out string
+	if typ != "" {
+		out = run("doqd", "add", typ, host)
+	} else {
+		out = run("doqd", "add", host)
+	}
 	// doqd add пишет конфиг и сам дёргает рестарт докера; мгновенный опрос
 	// показал бы старое состояние.
 	requestRefreshAfter(refreshAfterRestart)
@@ -354,6 +364,39 @@ func test(w http.ResponseWriter, r *http.Request) {
 	}
 	out := run("doqd", "test", host)
 	http.Redirect(w, r, "/?msg="+encode(out), 303)
+}
+
+func addDomain(w http.ResponseWriter, r *http.Request) {
+	domain := strings.TrimSpace(r.FormValue("domain"))
+	if domain == "" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустое значение"), 303)
+		return
+	}
+	out := run("doqd", "add-domain", domain)
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode(out), 303)
+}
+
+func removeDomain(w http.ResponseWriter, r *http.Request) {
+	domain := strings.TrimSpace(r.FormValue("domain"))
+	if domain == "" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустое значение"), 303)
+		return
+	}
+	out := run("doqd", "remove-domain", domain)
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode(out), 303)
+}
+
+func geo(w http.ResponseWriter, r *http.Request) {
+	out := run("doqd", "geo")
+	http.Redirect(w, r, "/?msg="+encode("doqd geo:\n"+out), 303)
+}
+
+func geoReselect(w http.ResponseWriter, r *http.Request) {
+	out := run("doqd", "geo", "reselect")
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("geo reselect:\n"+out), 303)
 }
 
 func restart(w http.ResponseWriter, r *http.Request) {
@@ -730,6 +773,21 @@ const pageHTML = `
     border-color: var(--accent);
     box-shadow: 0 0 0 2px rgba(0,180,216,0.2);
   }
+  select {
+    flex: 1;
+    min-width: 220px;
+    padding: 10px 14px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+  }
+  select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(0,180,216,0.2);
+  }
   label {
     display: block;
     font-size: 12px;
@@ -813,6 +871,15 @@ const pageHTML = `
           <label>DoQ URL</label>
           <div class="form-row">
             <input type="text" name="url" placeholder="quic://dns.example.com" required>
+          </div>
+          <label>Тип</label>
+          <div class="form-row">
+            <select name="type" style="flex:1;min-width:220px;padding:10px 14px;background:#0d1117;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;">
+              <option value="">upstream</option>
+              <option value="--geo">geo</option>
+              <option value="--fallback">fallback</option>
+              <option value="--force">force (пропустить проверку)</option>
+            </select>
             <button class="btn btn-primary" type="submit">Add</button>
           </div>
         </form>
@@ -843,6 +910,48 @@ const pageHTML = `
           <button class="btn btn-blue" type="submit">Test</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-header">Геоблокированный домен</div>
+      <div class="card-body">
+        <form method="POST" action="/add-domain">
+          <label>Домен (и поддомены)</label>
+          <div class="form-row">
+            <input type="text" name="domain" placeholder="example.com" required>
+            <button class="btn btn-primary" type="submit">Add</button>
+          </div>
+        </form>
+        <form method="POST" action="/remove-domain" style="margin-top:12px;">
+          <label>Удалить домен</label>
+          <div class="form-row">
+            <input type="text" name="domain" placeholder="example.com" required>
+            <button class="btn btn-red" type="submit">Remove</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Geo-серверы</div>
+      <div class="card-body">
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px;">
+          Закреплённый сервер обхода, рейтинг прокси, живость TLS.
+        </p>
+        <div class="form-row" style="flex-wrap:wrap;">
+          <form method="POST" action="/geo" style="display:inline;margin-right:8px;">
+            <button class="btn btn-primary" type="submit">📊 Geo</button>
+          </form>
+          <form method="POST" action="/geo-reselect" style="display:inline;">
+            <button class="btn btn-blue" type="submit">🔄 Reselect</button>
+          </form>
+        </div>
+        <p style="font-size:11px;color:var(--text2);margin-top:8px;">
+          Reselect — переоценить серверы обхода сейчас (до 45 с)
+        </p>
+      </div>
     </div>
   </div>
 </main>
