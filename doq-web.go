@@ -38,6 +38,84 @@ const (
 	refreshAfterRestart = 4 * time.Second
 )
 
+// doqd не печатает свою версию (команды `doqd version` в апстриме нет),
+// поэтому версия берётся так:
+//   - последняя версия апстрима — из GitHub API (кэшируется, лимит
+//     анонимных запросов 60/ч с одного IP);
+//   - установленная версия — из файла version.txt, который веб-панель
+//     пишет после успешного install/update. До первого обновления через
+//     панель файл пуст, и UI показывает только последнюю версию.
+const (
+	upstreamRepo    = "necronicle/keenetic-doq"
+	versionFile     = "/opt/etc/doq-web/version.txt"
+	latestRefreshIt = 6 * time.Hour
+)
+
+var (
+	latestMu      sync.Mutex
+	latestVer     string
+	latestFetched time.Time
+)
+
+// latestUpstream — tag_name последнего релиза keenetic-doq. Пустая строка
+// означает "не удалось получить" (нет интернета/лимит API) — UI это
+// переживает молча.
+func latestUpstream() string {
+	latestMu.Lock()
+	defer latestMu.Unlock()
+	if latestVer != "" && time.Since(latestFetched) < latestRefreshIt {
+		return latestVer
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://api.github.com/repos/"+upstreamRepo+"/releases/latest", nil)
+	if err != nil {
+		return latestVer
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return latestVer
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return latestVer
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil || rel.TagName == "" {
+		return latestVer
+	}
+	latestVer, latestFetched = rel.TagName, time.Now()
+	return latestVer
+}
+
+// installedDoqdVersion — версия, записанная после последней установки через
+// панель. Пустая строка, если файл ещё не создан.
+func installedDoqdVersion() string {
+	b, err := os.ReadFile(versionFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// saveInstalledDoqdVersion пишет установленную версию в version.txt.
+// Вызывается после успешного install/update. Ошибку глотаем: не записанный
+// файл только лишает UI строки "установлено", но не ломает работу.
+func saveInstalledDoqdVersion() {
+	v := latestUpstream()
+	if v == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(versionFile), 0o755); err != nil {
+		return
+	}
+	os.WriteFile(versionFile, []byte(v+"\n"), 0o644)
+}
+
 // listenAddr — адрес веб-интерфейса. ":8091" означает "все интерфейсы",
 // иначе UI недоступен с LAN (127.0.0.1 = только сам роутер).
 // 8091 согласован с install.sh.
@@ -412,6 +490,7 @@ func install(w http.ResponseWriter, r *http.Request) {
 		text += err.Error()
 	}
 	requestRefreshAfter(refreshAfterRestart)
+	saveInstalledDoqdVersion()
 	http.Redirect(w, r, "/?msg="+encode("Установка:\n"+text), 303)
 }
 
@@ -439,23 +518,18 @@ func update(w http.ResponseWriter, r *http.Request) {
 		text += err.Error()
 	}
 	requestRefreshAfter(refreshAfterRestart)
+	saveInstalledDoqdVersion()
 	http.Redirect(w, r, "/?msg="+encode("Обновление:\n"+text), 303)
 }
 
-// versionAPI возвращает текущую версию doqd в JSON для отображения на
-// странице. Вызывается при загрузке страницы и при обновлении.
-// Команда `doqd version` появилась в новых релизах keenetic-doq.
-// Если её нет — показываем пустую строку.
+// versionAPI возвращает установленную и последнюю версию doqd в JSON.
 func versionAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	out := run("doqd", "version")
-	// run() уже обрабатывает ошибки — если doqd version не поддерживается,
-	// вывод будет содержать "unknown command", а не пустую строку.
-	if strings.Contains(out, "unknown command") || strings.Contains(out, "Ошибка") {
-		out = ""
-	}
+	installed := installedDoqdVersion()
+	latest := latestUpstream()
 	json.NewEncoder(w).Encode(map[string]any{
-		"version": out,
+		"installed": installed,
+		"latest":    latest,
 	})
 }
 
@@ -528,6 +602,12 @@ const pageHTML = `
     border-radius: 4px;
     margin-left: 4px;
     font-weight: 400;
+  }
+  .version-tag.ver-new {
+    color: #fdba74;
+    background: #451a03;
+    border: 1px solid #9a3412;
+    cursor: pointer;
   }
 
   /* Buttons */
@@ -677,6 +757,7 @@ const pageHTML = `
     <span class="doq">DOQ</span>
     <div class="status-dot" id="dot" title="%[2]s"></div>
     <span class="version-tag" id="ver">—</span>
+    <span class="version-tag" id="verl" style="display:none">latest</span>
   </div>
   <div class="header-actions">
     <form method="POST" action="/install" style="display:inline" id="installform">
@@ -776,6 +857,7 @@ const pageHTML = `
   var stp = document.getElementById('stpre');
   var lpr = document.getElementById('lpre');
   var ver = document.getElementById('ver');
+  var verl = document.getElementById('verl');
   var form = document.getElementById('installform');
   var utype = document.getElementById('updateform');
   var timer = null;
@@ -884,9 +966,30 @@ const pageHTML = `
       if (!r.ok) { throw new Error('http'); }
       return r.json();
     }).then(function (d) {
-      if (ver && d.version) { ver.textContent = d.version; }
+      if (ver) {
+        if (d.installed) {
+          ver.textContent = d.installed;
+          ver.title = 'установлено';
+        } else {
+          ver.textContent = '?';
+          ver.title = 'не определено';
+        }
+        if (d.latest) {
+          if (verl) {
+            if (d.installed && d.installed === d.latest) {
+              verl.textContent = '●';
+              verl.style.color = '#22c55e';
+            } else {
+              verl.textContent = '↻ ' + d.latest;
+              verl.className = 'version-tag ver-new';
+              verl.title = 'доступно обновление — нажмите Update';
+            }
+            verl.style.display = '';
+          }
+        }
+      }
     }).catch(function () {
-      if (ver) { ver.textContent = '?'; }
+      if (ver) { ver.textContent = '?'; ver.title = 'нет связи'; }
     });
   }
   loadVersion();
