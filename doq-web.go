@@ -475,6 +475,10 @@ func onlyPOST(h http.HandlerFunc) http.HandlerFunc {
 // host с пробелами, URL без хоста. Это защищает от отправки doqd
 // команд вроде "doqd add example.com." (бесполезно) и от инъекций
 // через пробел/символы в аргумент exec.CommandContext.
+//
+// Если входные данные — полный URL (quic://...), схема сохраняется:
+// doqd remove/add/test принимают адреса вида quic://host[:port],
+// и без схемы он не находит апстрим в конфиге.
 func domainASCII(v string) (string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -501,6 +505,14 @@ func domainASCII(v string) (string, error) {
 	// Запрещаем конечную точку — она ломает IDNA ToASCII.
 	if strings.HasSuffix(host, ".") {
 		return "", errors.New("домен не должен заканчиваться на точку")
+	}
+	// Если входные данные — полный URL, возвращаем канонический
+	// scheme://host: doqd remove/add/test ищет апстрим в конфиге по
+	// полному адресу, а без схемы он не находит ("upstream geohide.ru
+	// not found in the config"). Хост берём из u.Host — разбор URL
+	// отсекает пробелы и прочие символы, которые doqd не примет.
+	if u.Scheme != "" {
+		return u.Scheme + "://" + host, nil
 	}
 	return host, nil
 }
