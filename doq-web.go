@@ -444,9 +444,16 @@ func update(w http.ResponseWriter, r *http.Request) {
 
 // versionAPI возвращает текущую версию doqd в JSON для отображения на
 // странице. Вызывается при загрузке страницы и при обновлении.
+// Команда `doqd version` появилась в новых релизах keenetic-doq.
+// Если её нет — показываем пустую строку.
 func versionAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	out := run("doqd", "version")
+	// run() уже обрабатывает ошибки — если doqd version не поддерживается,
+	// вывод будет содержать "unknown command", а не пустую строку.
+	if strings.Contains(out, "unknown command") || strings.Contains(out, "Ошибка") {
+		out = ""
+	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"version": out,
 	})
