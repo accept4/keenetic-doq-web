@@ -174,6 +174,7 @@ func main() {
 
 	http.HandleFunc("/", page)
 	http.HandleFunc("/api/status", statusAPI)
+	http.HandleFunc("/api/version", versionAPI)
 	// Мутирующие маршруты — только POST. Ссылка вида /install?id= или
 	// /stop, попавшая в превью мессенджера/антивирусного сканера или
 	// prefetch браузера, иначе выполняется сама по себе.
@@ -184,6 +185,7 @@ func main() {
 	http.HandleFunc("/stop", onlyPOST(stop))
 	http.HandleFunc("/start", onlyPOST(start))
 	http.HandleFunc("/install", onlyPOST(install))
+	http.HandleFunc("/update", onlyPOST(update))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -413,6 +415,43 @@ func install(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode("Установка:\n"+text), 303)
 }
 
+// update обновляет keenetic-doq до последней версии. Повторный запуск
+// install.sh ничего не ломает: он скачивает новый бинарник, сверяет SHA256
+// и перезапускает демона. Существующий конфиг сохраняется.
+func update(w http.ResponseWriter, r *http.Request) {
+	// Серверный WriteTimeout = 20s, обновление — до 3 минут. Без этого
+	// редирект с результатом не дописался бы: дедлайн истёк бы во время
+	// exec.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(4 * time.Minute))
+
+	const src = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sh", "-c", "curl -fsSL "+src+" | sh").CombinedOutput()
+	if len(out) > maxOutput {
+		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
+	}
+	text := strings.TrimSpace(stripANSI(string(out)))
+	if err != nil {
+		if text != "" {
+			text += "\n"
+		}
+		text += err.Error()
+	}
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Обновление:\n"+text), 303)
+}
+
+// versionAPI возвращает текущую версию doqd в JSON для отображения на
+// странице. Вызывается при загрузке страницы и при обновлении.
+func versionAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	out := run("doqd", "version")
+	json.NewEncoder(w).Encode(map[string]any{
+		"version": out,
+	})
+}
+
 // maxOutput ограничивает буфер вывода до 64 КБ, чтобы длинный вывод doqd
 // не жрал RAM на роутере с 32 МБ.
 const maxOutput = 64 << 10
@@ -474,6 +513,15 @@ const pageHTML = `
     box-shadow: 0 0 8px %[1]s;
   }
   .header-actions { display: flex; gap: 8px; align-items: center; }
+  .version-tag {
+    font-size: 11px;
+    color: var(--text2);
+    background: var(--surface2);
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 4px;
+    font-weight: 400;
+  }
 
   /* Buttons */
   .btn {
@@ -621,10 +669,14 @@ const pageHTML = `
     <span class="keen">KEENETIC</span>
     <span class="doq">DOQ</span>
     <div class="status-dot" id="dot" title="%[2]s"></div>
+    <span class="version-tag" id="ver">—</span>
   </div>
   <div class="header-actions">
     <form method="POST" action="/install" style="display:inline" id="installform">
       <button class="btn btn-install" id="installbtn" type="submit">⇩ Install</button>
+    </form>
+    <form method="POST" action="/update" style="display:inline" id="updateform">
+      <button class="btn btn-blue" id="updatebtn" type="submit">↻ Update</button>
     </form>
     <form method="POST" action="/start" style="display:inline">
       <button class="btn btn-green" type="submit">▶ Start</button>
@@ -716,17 +768,19 @@ const pageHTML = `
   var age = document.getElementById('age');
   var stp = document.getElementById('stpre');
   var lpr = document.getElementById('lpre');
+  var ver = document.getElementById('ver');
   var form = document.getElementById('installform');
+  var utype = document.getElementById('updateform');
   var timer = null;
   var GREEN = '#22c55e', RED = '#ef4444';
 
   // /install под капотом делает curl|sh с таймаутом 3 мин. Повторный submit
   // значил бы второй параллельный установщик поверх первого, поэтому форма
-  // запирается на 60 с: этого хватает, чтобы успеть увидеть результат.
+  // запирается на 60 с: этого хватит, чтобы успеть увидеть результат.
   if (form) {
     form.addEventListener('submit', function (e) {
       if (form.getAttribute('data-busy')) { e.preventDefault(); return; }
-      if (!window.confirm('Установить keenetic-doq на это устройство?\n\nСкрипт скажется с raw.githubusercontent.com/necronicle/keenetic-doq и перезапустит сервис.')) {
+      if (!window.confirm('Установить keenetic-doq на это устройство?\n\nСкрипт скачается с raw.githubusercontent.com/necronicle/keenetic-doq и перезапустит сервис.')) {
         e.preventDefault();
         return;
       }
@@ -743,6 +797,26 @@ const pageHTML = `
     });
   }
 
+  // /update тоже делает curl|sh, блокируем форму на 60 с.
+  if (utype) {
+    utype.addEventListener('submit', function (e) {
+      if (utype.getAttribute('data-busy')) { e.preventDefault(); return; }
+      if (!window.confirm('Обновить keenetic-doq до последней версии?\n\nСкрипт скачается и перезапустит сервис.')) {
+        e.preventDefault();
+        return;
+      }
+      utype.setAttribute('data-busy', '1');
+      var b = utype.querySelector('button');
+      if (b) {
+        b.disabled = true;
+        b.textContent = 'обновление…';
+      }
+      setTimeout(function () {
+        utype.removeAttribute('data-busy');
+        if (b) { b.disabled = false; b.textContent = 'Update'; }
+      }, 60000);
+    });
+  }
 
   // Старт/рестарт/стоп отвечают HTML-ом только когда systemctl закончит.
   // До этого момента опрос не нужен: он форкает doqd ровно тогда, когда
@@ -756,7 +830,7 @@ const pageHTML = `
   // клик больше не значит два параллельных systemctl.
   var allForms = document.querySelectorAll('form');
   for (var i = 0; i < allForms.length; i++) {
-    if (allForms[i] === form) { continue; }
+    if (allForms[i] === form || allForms[i] === utype) { continue; }
     allForms[i].addEventListener('submit', function () {
       stopPoll();
       var b = this.querySelector('button');
@@ -777,6 +851,7 @@ const pageHTML = `
     if (stp && typeof d.status === 'string') { stp.textContent = d.status; }
     if (lpr && typeof d.list === 'string') { lpr.textContent = d.list; }
     if (form && d.installed) { form.style.display = 'none'; }
+    if (utype && d.installed) { utype.style.display = 'none'; }
   }
 
   function poll() {
@@ -795,6 +870,19 @@ const pageHTML = `
   // Первый рендер делает сервер, поэтому первый опрос отложен на целый
   // интервал: иначе каждая загрузка страницы значит два форка doqd.
   timer = setTimeout(poll, 5000);
+
+  // Версия загружается один раз при загрузке страницы.
+  function loadVersion() {
+    fetch('/api/version', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error('http'); }
+      return r.json();
+    }).then(function (d) {
+      if (ver && d.version) { ver.textContent = d.version; }
+    }).catch(function () {
+      if (ver) { ver.textContent = '?'; }
+    });
+  }
+  loadVersion();
 
   // Скрытая вкладка роутер не нагружает.
   document.addEventListener('visibilitychange', function () {
