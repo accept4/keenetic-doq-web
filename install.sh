@@ -62,10 +62,30 @@ esac
 URL="https://github.com/$REPO/releases/latest/download/$BINARY"
 
 echo "Скачиваю $BINARY (таргет $TARGET) из $URL ..."
+# busybox curl на Keenetic не следует за редиректами HTTPS.
+# Скачиваем через GitHub API, который отдаёт прямой URL в JSON.
+api_url="https://api.github.com/repos/$REPO/releases/latest"
+raw_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -v bin="$BINARY" -F'"' '
+    /browser_download_url/ {
+        url = $0
+        # Извлекаем URL из найденной строки
+        match(url, /https:[^"]+/)
+        candidate = substr(url, RSTART, RLENGTH)
+        # Проверяем, что это нужный файл
+        if (index(candidate, bin) > 0) {
+            print candidate
+            exit
+        }
+    }
+')
+if [ -n "$raw_url" ]; then
+    URL="$raw_url"
+    echo "  -> resolved to $URL"
+fi
 curl -fsSL -o "$TMP" "$URL" || {
     rm -f "$TMP"
     echo "Ошибка: Не удалось скачать бинарник."
-    echo "Проверьте интернет-соединение и наличие скомпилированного файла в GitHub Releases."
+    echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
     exit 1
 }
 
@@ -81,7 +101,8 @@ magic=$(od -An -tx1 -N4 "$TMP" 2>/dev/null | tr -d ' \n')
 got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
 if [ "$magic" != "7f454c46" ]; then
     rm -f "$TMP"
-    echo "Ошибка: скачанный файл не является ELF-бинарником (содержимое не то, что ожидалось)."
+    echo "Ошибка: скачанный файл не является ELF-бинарником (вероятно, скачалась HTML-страница с GitHub)."
+    echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
     exit 1
 fi
 if [ "$got" != "$want" ]; then
