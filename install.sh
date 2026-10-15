@@ -91,20 +91,30 @@ fetch() { # $1 = url, $2 = output file
 # Проверка ELF: неверно определённый таргет приводит к "syntax error:
 # unexpected (": ядро отказывает в exec (ENOEXEC), а busybox sh читает
 # бинарник как скрипт. Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
+#
+# Магию читаем через head -c, а не od -N: на busybox v1.37 с роутера
+# `od -An -tx1 -N4` вернул пустоту для заведомо валидного ELF (файл, у
+# которого SHA256 совпал с релизным!), и установка падала с
+# "файл не является ELF-бинарником" на правильном бинарнике.
 want=01
 case "$TARGET" in
     mipssf-k3.4)   want=02 ;;
     mips64sf-k5.0) want=02 ;;
 esac
 
-is_elf() { # $1 = файл, 0 если это ELF
-    [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+elf_magic() { # $1 = файл, печатает 4 байта магии hex или пусто
+    head -c 4 "$1" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n\r'
+}
+
+elf_endian() { # $1 = файл, печатает байт EI_DATA (01/02) или пусто
+    head -c 6 "$1" 2>/dev/null | tail -c 1 | od -An -tx1 2>/dev/null | tr -d ' \n\r'
 }
 
 if [ -n "$LOCAL_FILE" ]; then
     # Локальный режим: копируем файл, GitHub не трогаем.
     cp "$LOCAL_FILE" "$TMP"
     echo "Скопировано из $LOCAL_FILE"
+    hash_ok=""
 else
     raw_base="https://raw.githubusercontent.com/$REPO/raw-bins"
     echo "Скачиваю $BINARY (таргет $TARGET)"
@@ -123,7 +133,8 @@ else
         exit 1
     fi
 
-    # SHA256SUMS — эталонный хеш для проверки целостности.
+    # SHA256SUMS — эталонный хеш. Совпадение доказывает целость лучше любого
+    # разбора заголовка, поэтому при hash_ok разбор ELF пропускаем.
     hash_ok=""
     if command -v sha256sum >/dev/null 2>&1; then
         fetch "$raw_base/SHA256SUMS" /opt/tmp/doq-web.sums \
@@ -145,27 +156,30 @@ else
     fi
 fi
 
-# 7. Проверяем ELF и порядок байт.
-if ! is_elf "$TMP"; then
-    rm -f "$TMP"
-    echo "Ошибка: файл не является ELF-бинарником (скачалась страница ошибки GitHub)."
-    echo "  Возможные причины:"
-    echo "  - Нет доступа к raw.githubusercontent.com"
-    echo "  - Файл не найден в ветке raw-bins"
-    echo "Офлайн-установка: скачайте файл на ПК и выполните"
-    echo "  sh install.sh --local /tmp/$BINARY"
-    exit 1
+# 7. ELF и порядок байт — только если SHA256 не подтвердил файл.
+if [ -z "$hash_ok" ]; then
+    magic=$(elf_magic "$TMP")
+    if [ "$magic" != "7f454c46" ]; then
+        rm -f "$TMP"
+        echo "Ошибка: файл не является ELF-бинарником (магия: '${magic:-пусто}', размер: $(wc -c < "$TMP" 2>/dev/null) байт)."
+        echo "  - Нет доступа к raw.githubusercontent.com"
+        echo "  - Файл не найден в ветке raw-bins"
+        echo "Офлайн-установка: скачайте файл на ПК и выполните"
+        echo "  sh install.sh --local /tmp/$BINARY"
+        exit 1
+    fi
+    got=$(elf_endian "$TMP")
+    if [ -n "$got" ] && [ "$got" != "$want" ]; then
+        rm -f "$TMP"
+        echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
+        echo "Проверьте вывод: opkg print-architecture"
+        exit 1
+    fi
+    echo "ELF OK (endianness ${got:-не проверен})"
 fi
-got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
-if [ "$got" != "$want" ]; then
-    rm -f "$TMP"
-    echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
-    echo "Проверьте вывод: opkg print-architecture"
-    exit 1
-fi
-echo "ELF OK (endianness $got)"
 
-# 8. Проверяем, что бинарник запускается.
+# 8. Бинарник должен запуститься: -version печатает версию и выходит.
+# Именно эта проверка ловит "не та архитектура" надёжнее разбора заголовков.
 "$TMP" -version >/dev/null 2>&1 \
     || { rm -f "$TMP"; echo "Ошибка: бинарник не запускается (wrong architecture?)"; exit 1; }
 echo "Binary OK"

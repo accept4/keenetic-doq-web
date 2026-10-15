@@ -51,6 +51,10 @@ const (
 	latestRefreshIt = 6 * time.Hour
 )
 
+// webVersion — версия самой панели; подставляется при сборке через
+// -ldflags "-X main.webVersion=v1.0.x". Флаг -version отдаёт её установщику.
+var webVersion = "dev"
+
 var (
 	latestMu      sync.Mutex
 	latestVer     string
@@ -251,8 +255,16 @@ func controlOutput(s string) string {
 }
 
 func main() {
+	// -version — как у doqd: печать версию и выйти. Установщик вызывает
+	// бинарник с этим флагом, чтобы убедиться, что он запускается на данной
+	// архитектуре. Без выхода main() ушёл бы в ListenAndServe и установщик
+	// завис бы навсегда.
 	for _, arg := range os.Args[1:] {
-		if arg == "--probe" {
+		switch arg {
+		case "-version", "--version":
+			fmt.Println("doq-web", webVersion)
+			return
+		case "--probe":
 			os.Exit(runProbe())
 		}
 	}
