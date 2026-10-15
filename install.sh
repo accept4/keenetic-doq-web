@@ -75,103 +75,140 @@ case "$TARGET" in
     *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
 
-# 6. Скачиваем или копируем бинарник
+# 6. Вспомогательные функции скачивания и проверки.
+#
+# GITHUB_TOKEN поднимает лимит GitHub API с 60 запросов в час на IP до 5000.
+# Без токена несколько установок подряд с одного белого IP (провайдерский NAT,
+# офис, несколько роутеров) упираются в "curl: (22) ... error: 403".
+fetch() { # $1 = url, $2 = файл назначения
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+    else
+        curl -fsSL -o "$2" "$1"
+    fi
+}
+
+gh_json() { # $1 = url, ответ API в stdout
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsSL -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" "$1"
+    else
+        curl -fsSL -H "Accept: application/vnd.github+json" "$1"
+    fi
+}
+
+# Проверка ELF: неверно определённый таргет приводит к "syntax error:
+# unexpected (": ядро отказывает в exec (ENOEXEC), а busybox sh читает
+# бинарник как скрипт. Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
+want=01
+case "$TARGET" in
+    mipssf-k3.4)   want=02 ;;
+    mips64sf-k5.0) want=02 ;;
+esac
+
+is_elf() { # $1 = файл, 0 если это ELF
+    [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+}
+
+# 7. Скачиваем или копируем бинарник.
 if [ -n "$LOCAL_FILE" ]; then
-    # Локальный режим: копируем файл и проверяем имя
+    # Локальный режим: копируем файл, GitHub не трогаем.
     cp "$LOCAL_FILE" "$TMP"
     echo "Скопировано из $LOCAL_FILE"
+    URL="(локальный файл)"
 else
-    # Онлайн-режим: скачиваем из GitHub Releases
-    URL="https://github.com/$REPO/releases/latest/download/$BINARY"
-    echo "Скачиваю $BINARY (таргет $TARGET) из $URL ..."
-    # busybox curl на Keenetic не следует за редиректами HTTPS.
-    # Скачиваем через GitHub API, который отдаёт прямой URL в JSON.
     api_url="https://api.github.com/repos/$REPO/releases/latest"
-    raw_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -v bin="$BINARY" -F'"' '
-        /browser_download_url/ {
-            url = $0
-            # Извлекаем URL из найденной строки
-            match(url, /https:[^"]+/)
-            candidate = substr(url, RSTART, RLENGTH)
-            # Проверяем, что это нужный файл
-            if (index(candidate, bin) > 0) {
-                print candidate
-                exit
-            }
-        }
-    ')
-    if [ -n "$raw_url" ]; then
-        URL="$raw_url"
-        echo "  -> resolved to $URL"
+    base_url="https://github.com/$REPO/releases/latest/download"
+
+    # JSON релиза берём ОДИН раз: из него и адрес бинарника, и адрес SHA256SUMS.
+    # Ответ пуст, если API недоступен или вернул 403 (лимит запросов) — тогда
+    # ставим по прямому адресу /releases/latest/download/, он отдельного
+    # лимита не имеет.
+    rel_json=$(gh_json "$api_url" 2>/dev/null || true)
+    if [ -z "$rel_json" ]; then
+        echo "GitHub API недоступен (403 — лимит 60 запросов/час на IP?) — качаю по прямому адресу."
     fi
-    curl -fsSL -o "$TMP" "$URL" || {
+
+    asset_url() { # $1 = имя файла в релизе
+        [ -n "$rel_json" ] || return 0
+        printf '%s' "$rel_json" | awk -v want="$1" '
+            /"browser_download_url"/ {
+                match($0, /https:[^"]+/)
+                u = substr($0, RSTART, RLENGTH)
+                if (substr(u, length(u) - length(want) + 1) == want) { print u; exit }
+            }'
+    }
+
+    # Прямой адрес идёт первым: он работает и без API. Адрес из JSON — запасной
+    # на случай, если прямой отдаёт страницу ошибки вместо файла.
+    SUMS_URL=""
+    URL=""
+    for u in "$base_url/$BINARY" "$(asset_url "$BINARY")"; do
+        [ -n "$u" ] || continue
+        echo "Скачиваю $BINARY (таргет $TARGET): $u"
+        if ! fetch "$u" "$TMP"; then
+            echo "  -> curl вернул код $? (403 — лимит GitHub, 404 — файла нет в релизе)"
+            continue
+        fi
+        if ! is_elf "$TMP"; then
+            echo "  -> это не ELF (скачалась страница ошибки GitHub), пробую следующий адрес"
+            continue
+        fi
+        URL="$u"
+        break
+    done
+    [ -n "$URL" ] || {
         rm -f "$TMP"
-        echo "Ошибка: Не удалось скачать бинарник."
-        echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
-        echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
+        echo "Ошибка: не удалось скачать бинарник ни по одному из адресов."
+        echo "  403 — GitHub ограничил запросы с вашего IP (60/час без токена):"
+        echo "        повторите позже либо передайте токен: GITHUB_TOKEN=xxx sh install.sh"
+        echo "  404 — проверьте, что тег с этим бинарником опубликован в Releases."
+        echo "Офлайн-установка: скачайте файл на ПК и выполните"
+        echo "  sh install.sh --local /tmp/$BINARY"
         exit 1
     }
-fi
 
-# 7. Проверяем SHA256SUMS из релиза (только для онлайн-установки)
-if [ -z "$LOCAL_FILE" ] && command -v sha256sum >/dev/null 2>&1; then
-    sums_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -F'"' '
-        /browser_download_url/ {
-            url = $0
-            match(url, /https:[^"]+/)
-            candidate = substr(url, RSTART, RLENGTH)
-            if (index(candidate, "SHA256SUMS") > 0) {
-                print candidate
-                exit
-            }
-        }
-    ')
-    if [ -n "$sums_url" ]; then
+    # 8. Проверяем SHA256SUMS релиза (если sha256sum есть на роутере).
+    if command -v sha256sum >/dev/null 2>&1; then
+        SUMS_URL="$(asset_url SHA256SUMS)"
+        [ -n "$SUMS_URL" ] || SUMS_URL="$base_url/SHA256SUMS"
         sums_tmp="$BIN_DIR/$NAME.sums"
-        curl -fsSL -o "$sums_tmp" "$sums_url" 2>/dev/null || true
-        if [ -f "$sums_tmp" ]; then
+        if fetch "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
             want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
             got_hash=$(sha256sum "$TMP" | awk '{print $1}')
             rm -f "$sums_tmp"
-            if [ -n "$want_hash" ] && [ "$got_hash" != "$want_hash" ]; then
-                rm -f "$TMP"
-                echo "Ошибка: SHA256 не совпадает (скачанный файл повреждён)."
-                exit 1
-            fi
             if [ -n "$want_hash" ]; then
+                if [ "$got_hash" != "$want_hash" ]; then
+                    rm -f "$TMP"
+                    echo "Ошибка: SHA256 не совпадает (скачанный файл повреждён)."
+                    exit 1
+                fi
                 echo "SHA256 OK"
             fi
+        else
+            rm -f "$sums_tmp"
+            echo "SHA256SUMS недоступен — проверку пропускаю"
         fi
     fi
 fi
 
-# 8. Проверяем, что скачан ELF с нужным порядком байт. Без этого неверно
-# определённый таргет приводит к "syntax error: unexpected (": ядро
-# отказывает в exec (ENOEXEC), а busybox sh читает бинарник как скрипт.
-# Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
-want=01
-case "$TARGET" in
-    mipssf-k3.4)       want=02 ;;
-    mips64sf-k5.0)     want=02 ;;
-esac
-magic=$(od -An -tx1 -N4 "$TMP" 2>/dev/null | tr -d ' \n')
-got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
-if [ "$magic" != "7f454c46" ]; then
+# 9. Проверяем ELF и порядок байт.
+if ! is_elf "$TMP"; then
     rm -f "$TMP"
-    echo "Ошибка: скачанный файл не является ELF-бинарником (вероятно, скачалась HTML-страница с GitHub)."
-    echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
-    echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
+    echo "Ошибка: файл не является ELF-бинарником (скачалась страница ошибки GitHub)."
+    echo "Офлайн-установка: sh install.sh --local /tmp/$BINARY"
     exit 1
 fi
+got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
 if [ "$got" != "$want" ]; then
     rm -f "$TMP"
-    echo "Ошибка: порядок байт скачанного бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
+    echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
     echo "Проверьте вывод: opkg print-architecture"
     exit 1
 fi
 echo "ELF OK (endianness $got)"
 
-# 9. Проверяем, что бинарник запускается
+# 10. Проверяем, что бинарник запускается
 "$TMP" -version >/dev/null 2>&1 || {
     rm -f "$TMP"
     echo "Ошибка: скачанный бинарник не запускается (возможно, не подходит для вашей архитектуры)."
@@ -179,13 +216,13 @@ echo "ELF OK (endianness $got)"
 }
 echo "Binary OK"
 
-# 5. Устанавливаем бинарный файл
+# 11. Устанавливаем бинарный файл
 chmod +x "$TMP"
 mv "$TMP" "$BIN_DIR/$NAME"
 sync
 echo "Установлен бинарник: $BIN_DIR/$NAME"
 
-# 6. Создаем службу автозапуска для Entware (rc.unslung)
+# 12. Создаем службу автозапуска для Entware (rc.unslung)
 mkdir -p "$INIT_DIR"
 cat > "$INIT_DIR/S57doq-web" << 'EOF'
 #!/bin/sh
@@ -202,10 +239,10 @@ EOF
 
 chmod +x "$INIT_DIR/S57doq-web"
 
-# 7. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
+# 13. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
 # На современных KeeneticOS /flash — read-only, и это не проблема: ndm при
 # монтировании раздела с /opt сам запускает скрипты /opt/etc/init.d/S*,
-# а S57doq-web создан на шаге 6. Неудачная запись не должна ронять
+# а S57doq-web создан на шаге 12. Неудачная запись не должна ронять
 # установку — на set -e перенаправление >> убило бы скрипт до запуска сервиса.
 RC_LINE='if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi'
 if grep -qs "S57doq-web" /flash/rc.custom 2>/dev/null; then
@@ -217,7 +254,7 @@ else
     echo "rc.custom недоступен (read-only) — автозапуск через /opt/etc/init.d/S57doq-web"
 fi
 
-# 8. Перезапускаем сервис.
+# 14. Перезапускаем сервис.
 #
 # При обновлении старый doq-web уже запущен и держит порт 8091. Если просто
 # вызвать start, rc.func увидит живой PID из pid-файла, решит "уже работает" и
@@ -258,7 +295,7 @@ else
     exit 1
 fi
 
-# 9. Определяем локальный IP-адрес роутера
+# 15. Определяем локальный IP-адрес роутера
 IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP=$(ip -4 addr show br1 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP="<IP-роутера>"
