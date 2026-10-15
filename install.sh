@@ -77,23 +77,38 @@ esac
 
 # 6. Вспомогательные функции скачивания и проверки.
 #
+# busybox curl на Keenetic не следует за HTTPS-редиректами (302 → 302 →
+# 302) без флага -L. Поэтому fetch() использует -L, а fetch_nol() — без.
+#
 # GITHUB_TOKEN поднимает лимит GitHub API с 60 запросов в час на IP до 5000.
 # Без токена несколько установок подряд с одного белого IP (провайдерский NAT,
 # офис, несколько роутеров) упираются в "curl: (22) ... error: 403".
-fetch() { # $1 = url, $2 = файл назначения
+fetch() { # $1 = url, $2 = файл — скачивание с -L (следовать редиректам)
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+        curl -fsSL --connect-timeout 10 --max-time 300 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
     else
-        curl -fsSL -o "$2" "$1"
+        curl -fsSL --connect-timeout 10 --max-time 300 -o "$2" "$1"
+    fi
+}
+
+fetch_nol() { # $1 = url, $2 = файл — без -L (на случай если URL не редиректит)
+    if [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsS --connect-timeout 10 --max-time 300 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+    else
+        curl -fsS --connect-timeout 10 --max-time 300 -o "$2" "$1"
     fi
 }
 
 gh_json() { # $1 = url, ответ API в stdout
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL -H "Accept: application/vnd.github+json" \
+        curl -fsSL --connect-timeout 5 --max-time 15 \
+            -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" "$1"
     else
-        curl -fsSL -H "Accept: application/vnd.github+json" "$1"
+        curl -fsSL --connect-timeout 5 --max-time 15 \
+            -H "Accept: application/vnd.github+json" "$1"
     fi
 }
 
@@ -139,30 +154,43 @@ else
             }'
     }
 
-    # Прямой адрес идёт первым: он работает и без API. Адрес из JSON — запасной
-    # на случай, если прямой отдаёт страницу ошибки вместо файла.
+    # busybox curl на Keenetic не следует за редиректами HTTPS, поэтому
+    # пробуем с -L (curl сам перейдёт по 302). Если не сработало —
+    # пробовать без -L (на случай если URL не редиректит).
     SUMS_URL=""
     URL=""
-    for u in "$base_url/$BINARY" "$(asset_url "$BINARY")"; do
-        [ -n "$u" ] || continue
-        echo "Скачиваю $BINARY (таргет $TARGET): $u"
-        if ! fetch "$u" "$TMP"; then
-            echo "  -> curl вернул код $? (403 — лимит GitHub, 404 — файла нет в релизе)"
-            continue
-        fi
-        if ! is_elf "$TMP"; then
-            echo "  -> это не ELF (скачалась страница ошибки GitHub), пробую следующий адрес"
-            continue
-        fi
-        URL="$u"
-        break
+    for nol in "" "nol"; do
+        for u in "$base_url/$BINARY" "$(asset_url "$BINARY")"; do
+            [ -n "$u" ] || continue
+            echo "Скачиваю $BINARY (таргет $TARGET): $u"
+            if [ "$nol" = "nol" ]; then
+                if ! fetch_nol "$u" "$TMP"; then
+                    echo "  -> curl без -L вернул код $?"
+                    continue
+                fi
+            else
+                if ! fetch "$u" "$TMP"; then
+                    echo "  -> curl с -L вернул код $?"
+                    continue
+                fi
+            fi
+            if is_elf "$TMP"; then
+                URL="$u"
+                echo "  -> OK (ELF, $(wc -c < "$TMP") байт)"
+                break 2
+            else
+                echo "  -> не ELF (скачалась страница ошибки GitHub), пробую"
+            fi
+        done
     done
     [ -n "$URL" ] || {
         rm -f "$TMP"
-        echo "Ошибка: не удалось скачать бинарник ни по одному из адресов."
-        echo "  403 — GitHub ограничил запросы с вашего IP (60/час без токена):"
-        echo "        повторите позже либо передайте токен: GITHUB_TOKEN=xxx sh install.sh"
-        echo "  404 — проверьте, что тег с этим бинарником опубликован в Releases."
+        echo "Ошибка: не удалось скачать бинарник."
+        echo "  Возможные причины:"
+        echo "  - Нет доступа к github.com (DNS, фаервол, прокси)"
+        echo "  - Нет сертификатов CA: opkg install ca-bundle"
+        echo "  - Лимит API GitHub (403): повторите позже"
+        echo "  - Файл слишком большой для RAM: шлем по частям"
         echo "Офлайн-установка: скачайте файл на ПК и выполните"
         echo "  sh install.sh --local /tmp/$BINARY"
         exit 1
@@ -173,7 +201,7 @@ else
         SUMS_URL="$(asset_url SHA256SUMS)"
         [ -n "$SUMS_URL" ] || SUMS_URL="$base_url/SHA256SUMS"
         sums_tmp="$BIN_DIR/$NAME.sums"
-        if fetch "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
+        if fetch_nol "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
             want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
             got_hash=$(sha256sum "$TMP" | awk '{print $1}')
             rm -f "$sums_tmp"
