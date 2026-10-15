@@ -275,6 +275,7 @@ func main() {
 	http.HandleFunc("/geo-reselect", onlyPOST(geoReselect))
 	http.HandleFunc("/add-domain", onlyPOST(addDomain))
 	http.HandleFunc("/remove-domain", onlyPOST(removeDomain))
+	http.HandleFunc("/domains", domainsJSON)
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -411,6 +412,67 @@ func removeDomain(w http.ResponseWriter, r *http.Request) {
 	out := run("doqd", "remove-domain", domain)
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode(out), 303)
+}
+
+// builtinGeoDomains — встроенный список геоблокированных доменов doqd.
+// doqd remove-domain не позволяет удалить встроенный, но веб-панель должна
+// показать, что домен встроен (чтобы не удалять зря). Список берётся из
+// internal/geo/builtin.go апстрима: https://github.com/necronicle/keenetic-doq
+var builtinGeoDomains = []string{
+	"chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
+	"gemini.google.com", "bard.google.com", "deepmind.com",
+	"poe.com", "perplexity.ai", "midjourney.com",
+	"discord.com", "discord.gg", "tiktok.com",
+	"t.me", "telegram.org", "whatsapp.com", "messenger.com",
+	"twitter.com", "x.com", "instagram.com", "facebook.com",
+	"tiktokcdn.com", "tiktokv.com", "snap.com", "snapchat.com",
+	"netflix.com", "discomax.com", "hulu.com", "spotify.com",
+	"twitch.tv", "twitchcdn.net", "youtube.com", "ytimg.com",
+	"googlevideo.com", "ggpht.com",
+}
+
+// domainsJSON — API: /domains -> [{"domain":"chatgpt.com","builtin":true}, ...]
+func domainsJSON(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", 405)
+		return
+	}
+
+	// Читаем конфиг и извлекаем geo-domain строки
+	b, err := os.ReadFile("/opt/etc/doqd.conf")
+	if err != nil {
+		http.Error(w, "conf not found", 500)
+		return
+	}
+
+	builtinSet := make(map[string]bool, len(builtinGeoDomains))
+	for _, d := range builtinGeoDomains {
+		builtinSet[d] = true
+	}
+
+	// Парсим строки вида "geo-domain example.com"
+	var domains []struct {
+		Domain  string `json:"domain"`
+		Builtin bool   `json:"builtin"`
+	}
+
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(strings.ToLower(line))
+		if !strings.HasPrefix(line, "geo-domain ") {
+			continue
+		}
+		domain := strings.TrimSpace(strings.TrimPrefix(line, "geo-domain "))
+		if domain == "" || strings.HasPrefix(domain, "#") {
+			continue
+		}
+		domains = append(domains, struct {
+			Domain  string `json:"domain"`
+			Builtin bool   `json:"builtin"`
+		}{Domain: domain, Builtin: builtinSet[domain]})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(domains)
 }
 
 func geo(w http.ResponseWriter, r *http.Request) {
@@ -969,10 +1031,13 @@ const pageHTML = `
         <form method="POST" action="/remove-domain" style="margin-top:12px;">
           <label>Удалить домен</label>
           <div class="form-row">
-            <input type="text" name="domain" placeholder="example.com" required>
+            <select name="domain" id="domainSelect" required>
+              <option value="">— Выберите домен —</option>
+            </select>
             <button class="btn btn-red" type="submit">Remove</button>
           </div>
         </form>
+        <div id="domainList" style="margin-top:12px;"></div>
       </div>
     </div>
 
@@ -997,6 +1062,37 @@ const pageHTML = `
     </div>
   </div>
 </main>
+
+<script>
+(function () {
+  // Список геоблокированных доменов: загрузка из /domains, отображение
+  // в виде чипов и заполнение выпадающего списка для удаления.
+  var domainList = document.getElementById('domainList');
+  var domainSelect = document.getElementById('domainSelect');
+  function loadDomains() {
+    fetch('/domains').then(function(r) { return r.json(); }).then(function(list) {
+      if (!domainSelect) return;
+      var prev = domainSelect.value;
+      domainSelect.innerHTML = '<option value="">— Выберите домен —</option>';
+      var chips = '';
+      for (var i = 0; i < list.length; i++) {
+        var d = list[i];
+        var opt = document.createElement('option');
+        opt.value = d.domain;
+        opt.textContent = d.domain + (d.builtin ? ' (встроенный)' : '');
+        if (!d.builtin) domainSelect.appendChild(opt);
+        var cls = d.builtin ? 'opacity:.5' : '';
+        chips += '<span style="display:inline-block;padding:2px 8px;margin:2px;border-radius:4px;font-size:11px;background:' + (d.builtin ? '#374151' : '#1e3a5f') + ';color:#e5e7eb;' + cls + '">' + d.domain + (d.builtin ? ' <small>🔒</small>' : '') + '</span>';
+      }
+      if (chips) domainList.innerHTML = '<div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">В конфиге (' + list.length + '):</div><div>' + chips + '</div>';
+      else domainList.innerHTML = '<div style="font-size:11px;color:#9ca3af;">Список пуст</div>';
+      if (prev) domainSelect.value = prev;
+    }).catch(function() {
+      if (domainList) domainList.innerHTML = '<div style="font-size:11px;color:#ef4444;">Не удалось загрузить список</div>';
+    });
+  }
+  loadDomains();
+</script>
 
 <script>
 (function () {
