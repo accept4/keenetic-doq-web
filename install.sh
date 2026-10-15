@@ -75,44 +75,17 @@ case "$TARGET" in
     *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
 
-# 6. Вспомогательные функции скачивания и проверки.
+# 6. Скачиваем или копируем бинарник — как в upstream keenetic-doq.
 #
-# --speed-limit/--speed-time обрывают "зависшее" соединение: если скорость
-# ниже 2 КБ/с держится 20 с — прервать. Файлы релизов GitHub отдаёт с
-# objects.githubusercontent.com после редиректа; когда этот хост недоступен
-# (DNS/TCP-фильтрация), curl без этих флагов молча висит до --max-time.
-#
-# GITHUB_TOKEN поднимает лимит GitHub API с 60 запросов в час на IP до 5000.
-fetch() { # $1 = url, $2 = файл; показывает прогресс, обрыв при <2КБ/с 20с
+# Единственный fetch: curl -fsSL. Никаких --speed-limit, --connect-timeout,
+# --max-time, API-запросов, raw-bins веток, зеркал. Одна команда — и файл
+# скачан. Редирект github.com → objects.githubusercontent.com работает через
+# -L (встроен в -fsSL).
+fetch() { # $1 = url, $2 = output file
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fL --connect-timeout 10 --max-time 240 \
-            --speed-limit 2048 --speed-time 20 \
-            -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
     else
-        curl -fL --connect-timeout 10 --max-time 240 \
-            --speed-limit 2048 --speed-time 20 -o "$2" "$1"
-    fi
-}
-
-fetch_q() { # то же, но тихо (для мелких служебных файлов)
-    if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL --connect-timeout 10 --max-time 60 \
-            --speed-limit 2048 --speed-time 20 \
-            -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
-    else
-        curl -fsSL --connect-timeout 10 --max-time 60 \
-            --speed-limit 2048 --speed-time 20 -o "$2" "$1"
-    fi
-}
-
-gh_json() { # $1 = url, ответ API в stdout
-    if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL --connect-timeout 5 --max-time 15 \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GITHUB_TOKEN" "$1"
-    else
-        curl -fsSL --connect-timeout 5 --max-time 15 \
-            -H "Accept: application/vnd.github+json" "$1"
+        curl -fsSL -o "$2" "$1"
     fi
 }
 
@@ -129,113 +102,35 @@ is_elf() { # $1 = файл, 0 если это ELF
     [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
 }
 
-# 7. Скачиваем или копируем бинарник.
 if [ -n "$LOCAL_FILE" ]; then
     # Локальный режим: копируем файл, GitHub не трогаем.
     cp "$LOCAL_FILE" "$TMP"
     echo "Скопировано из $LOCAL_FILE"
-    URL="(локальный файл)"
 else
-    api_url="https://api.github.com/repos/$REPO/releases/latest"
+    base="https://github.com/$REPO/releases/latest/download"
+    echo "Скачиваю $BINARY (таргет $TARGET)"
+    fetch "$base/$BINARY" "$TMP" \
+        || { rm -f "$TMP"; echo "Ошибка: download failed (нет сети? приватный репо? --local)"; exit 1; }
 
-    # JSON релиза берём ОДИН раз: из него тег и эталонные SHA256SUMS.
-    # Если API недоступен — работаем без него, эталонный хеш не проверяем.
-    rel_json=$(gh_json "$api_url" 2>/dev/null || true)
-    if [ -z "$rel_json" ]; then
-        echo "GitHub API недоступен (403/таймаут) — работаю без него."
-    fi
-
-    tag=$(printf '%s' "$rel_json" | awk -F'"' '/"tag_name"/ {print $4; exit}')
-    raw_base="https://raw.githubusercontent.com/$REPO/raw-bins"
-
-    # 7a. Скачиваем SHA256SUMS для эталонного хеша (и как тест доступности raw).
-    want_hash=""
-    sums_tmp="$BIN_DIR/$NAME.sums"
+    # SHA256SUMS — как в upstream: если sha256sum есть, проверяем.
     if command -v sha256sum >/dev/null 2>&1; then
-        if fetch_q "$raw_base/SHA256SUMS" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
-            want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
-            rm -f "$sums_tmp"
-            echo "SHA256SUMS получен (с raw-bins)"
-        else
-            rm -f "$sums_tmp"
-            echo "SHA256SUMS с raw-bins недоступен — проверяю через API"
-            # Fallback: берём хеш из API-ответа релиза
-            want_hash=$(printf '%s' "$rel_json" | awk -v f="$BINARY" '
-                /"assets"/ { in_assets=1 }
-                in_assets && /"browser_download_url"/ {
-                    match($0, /https:[^"]+/)
-                    u = substr($0, RSTART, RLENGTH)
-                    if (substr(u, length(u) - length(f) + 1) == f) {
-                        asset_url = u; in_assets=0
-                    }
-                }
-                in_assets && /"content_length"/ {
-                    match($0, /[0-9]+/)
-                    cl = substr($0, RSTART, RLENGTH) + 0
-                    if (asset_url && cl > 1000000) print asset_url
-                }
-            ' 2>/dev/null)
-            # Если не получилось извлечь из JSON — хеш не проверяем
-            want_hash=""
-            echo "Эталонный хеш не определён — проверка целостности пропущена"
-        fi
+        fetch "$base/SHA256SUMS" /opt/tmp/doq-web.sums \
+            || { rm -f "$TMP"; echo "Ошибка: SHA256SUMS download failed"; exit 1; }
+        want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' /opt/tmp/doq-web.sums)
+        got_hash=$(sha256sum "$TMP" | awk '{print $1}')
+        rm -f /opt/tmp/doq-web.sums
+        [ -n "$want_hash" ] && [ "$got_hash" = "$want_hash" ] \
+            || { rm -f "$TMP"; echo "Ошибка: SHA256 mismatch — corrupted download"; exit 1; }
+        echo "SHA256 OK"
+    else
+        echo "WARNING: sha256sum not found, skipping checksum"
     fi
-
-    # 7b. Кандидаты: raw-bins (без редиректов, тот же хост что install.sh)
-    # первый, затем fallback-варианты.
-    set -- "$raw_base/$BINARY"
-    # Если API дал тег — попробуем direct download URL из релиза
-    if [ -n "$tag" ]; then
-        set -- "$@" "https://github.com/$REPO/releases/download/$tag/$BINARY"
-    fi
-    # API-адрес (прямой download URL)
-    api_bin=$(asset_url "$BINARY")
-    [ -n "$api_bin" ] && set -- "$@" "$api_bin"
-    # Зеркала (только если есть эталонный хеш)
-    if [ -n "$want_hash" ] && [ -n "$tag" ]; then
-        for m in "https://ghfast.top" "https://gh-proxy.com" "https://ghproxy.net"; do
-            set -- "$@" "$m/https://github.com/$REPO/releases/download/$tag/$BINARY"
-        done
-    fi
-
-    URL=""
-    for u in "$@"; do
-        echo "Скачиваю $BINARY: $u"
-        if ! fetch "$u" "$TMP"; then
-            rc=$?
-            echo "  -> curl код $rc (сеть/файл недоступен, пробую дальше)"
-            continue
-        fi
-        if ! is_elf "$TMP"; then
-            echo "  -> не ELF (страница ошибки), пробую дальше"
-            continue
-        fi
-        if [ -n "$want_hash" ] && command -v sha256sum >/dev/null 2>&1; then
-            got_hash=$(sha256sum "$TMP" | awk '{print $1}')
-            if [ "$got_hash" != "$want_hash" ]; then
-                echo "  -> SHA256 не совпал, пробую дальше"
-                continue
-            fi
-            echo "SHA256 OK"
-        fi
-        URL="$u"
-        echo "  -> OK ($(wc -c < "$TMP") байт)"
-        break
-    done
-    [ -n "$URL" ] || {
-        rm -f "$TMP"
-        echo "Ошибка: не удалось скачать бинарник."
-        echo "  Проверьте сеть: curl -fsSL https://raw.githubusercontent.com >/dev/null && echo ok"
-        echo "Офлайн-установка: скачайте файл на ПК и выполните"
-        echo "  sh install.sh --local /tmp/$BINARY"
-        exit 1
-    }
 fi
 
-# 9. Проверяем ELF и порядок байт.
+# 7. Проверяем ELF и порядок байт.
 if ! is_elf "$TMP"; then
     rm -f "$TMP"
-    echo "Ошибка: файл не является ELF-бинарником (скачалась страница ошибки GitHub)."
+    echo "Ошибка: файл не является ELF-бинарником."
     echo "Офлайн-установка: sh install.sh --local /tmp/$BINARY"
     exit 1
 fi
@@ -248,21 +143,18 @@ if [ "$got" != "$want" ]; then
 fi
 echo "ELF OK (endianness $got)"
 
-# 10. Проверяем, что бинарник запускается
-"$TMP" -version >/dev/null 2>&1 || {
-    rm -f "$TMP"
-    echo "Ошибка: скачанный бинарник не запускается (возможно, не подходит для вашей архитектуры)."
-    exit 1
-}
+# 8. Проверяем, что бинарник запускается.
+"$TMP" -version >/dev/null 2>&1 \
+    || { rm -f "$TMP"; echo "Ошибка: бинарник не запускается (wrong architecture?)"; exit 1; }
 echo "Binary OK"
 
-# 11. Устанавливаем бинарный файл
+# 9. Устанавливаем бинарный файл
 chmod +x "$TMP"
 mv "$TMP" "$BIN_DIR/$NAME"
 sync
 echo "Установлен бинарник: $BIN_DIR/$NAME"
 
-# 12. Создаем службу автозапуска для Entware (rc.unslung)
+# 10. Создаем службу автозапуска для Entware (rc.unslung)
 mkdir -p "$INIT_DIR"
 cat > "$INIT_DIR/S57doq-web" << 'EOF'
 #!/bin/sh
@@ -279,10 +171,10 @@ EOF
 
 chmod +x "$INIT_DIR/S57doq-web"
 
-# 13. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
+# 11. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
 # На современных KeeneticOS /flash — read-only, и это не проблема: ndm при
 # монтировании раздела с /opt сам запускает скрипты /opt/etc/init.d/S*,
-# а S57doq-web создан на шаге 12. Неудачная запись не должна ронять
+# а S57doq-web создан на шаге 10. Неудачная запись не должна ронять
 # установку — на set -e перенаправление >> убило бы скрипт до запуска сервиса.
 RC_LINE='if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi'
 if grep -qs "S57doq-web" /flash/rc.custom 2>/dev/null; then
@@ -294,7 +186,7 @@ else
     echo "rc.custom недоступен (read-only) — автозапуск через /opt/etc/init.d/S57doq-web"
 fi
 
-# 14. Перезапускаем сервис.
+# 12. Перезапускаем сервис.
 #
 # При обновлении старый doq-web уже запущен и держит порт 8091. Если просто
 # вызвать start, rc.func увидит живой PID из pid-файла, решит "уже работает" и
@@ -335,7 +227,7 @@ else
     exit 1
 fi
 
-# 15. Определяем локальный IP-адрес роутера
+# 13. Определяем локальный IP-адрес роутера
 IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP=$(ip -4 addr show br1 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP="<IP-роутера>"
