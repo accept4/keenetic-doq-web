@@ -15,14 +15,24 @@ if [ ! -d "/opt/bin" ] && [ ! -d "/opt/sbin" ]; then
     exit 1
 fi
 
-# 2. Проверяем утилиту curl
-if ! command -v curl >/dev/null 2>&1; then
+# 2. Поддержка --local режима (установка из локального файла)
+LOCAL_FILE=""
+if [ "$1" = "--local" ]; then
+    [ -n "$2" ] || { echo "Ошибка: укажите путь к бинарнику: sh install.sh --local ./doq-web-linux-<arch>"; exit 1; }
+    [ -f "$2" ] || { echo "Ошибка: файл не найден: $2"; exit 1; }
+    LOCAL_FILE="$2"
+    echo "Режим --local: устанавливаем из $LOCAL_FILE"
+fi
+
+# 3. Проверяем утилиту curl (нужна только для онлайн-установки)
+if [ -z "$LOCAL_FILE" ] && ! command -v curl >/dev/null 2>&1; then
     echo "Ошибка: curl не установлен!"
     echo "Установите его командой: opkg update && opkg install curl"
+    echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
     exit 1
 fi
 
-# 3. Определяем архитектуру системы.
+# 4. Определяем архитектуру системы.
 # Entware (на котором держится весь установщик) точно знает свой таргет:
 # opkg print-architecture возвращает строки вроде aarch64-k3.10,
 # mipselsf-k3.4, mipssf-k3.4 и т.д. uname -m на Keenetic отдаёт "mips"
@@ -46,12 +56,13 @@ detect_arch() {
 TARGET=$(detect_arch)
 echo "Определённый таргет Entware: $TARGET"
 
-# 4. Скачиваем бинарник из последней версии GitHub Releases
+# 5. Скачиваем бинарник из последней версии GitHub Releases
 # /tmp на роутерах — это tmpfs (RAM), поэтому скачиваем сразу в BIN_DIR,
 # иначе на моделях с 32-64 МБ RAM скачивание вызывает OOM-kill.
 mkdir -p "$BIN_DIR"
 TMP="$BIN_DIR/$NAME.part"
-# Бинарники собираются под конкретный таргет, имя соответствует архитектуре.
+
+# Определяем имя бинарника для таргета
 case "$TARGET" in
     aarch64-k3.10)       BINARY="doq-web-linux-arm64" ;;
     armv7sf-k3.2)        BINARY="doq-web-linux-arm" ;;
@@ -63,38 +74,47 @@ case "$TARGET" in
     x64-k3.2)            BINARY="doq-web-linux-amd64" ;;
     *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
-URL="https://github.com/$REPO/releases/latest/download/$BINARY"
 
-echo "Скачиваю $BINARY (таргет $TARGET) из $URL ..."
-# busybox curl на Keenetic не следует за редиректами HTTPS.
-# Скачиваем через GitHub API, который отдаёт прямой URL в JSON.
-api_url="https://api.github.com/repos/$REPO/releases/latest"
-raw_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -v bin="$BINARY" -F'"' '
-    /browser_download_url/ {
-        url = $0
-        # Извлекаем URL из найденной строки
-        match(url, /https:[^"]+/)
-        candidate = substr(url, RSTART, RLENGTH)
-        # Проверяем, что это нужный файл
-        if (index(candidate, bin) > 0) {
-            print candidate
-            exit
+# 6. Скачиваем или копируем бинарник
+if [ -n "$LOCAL_FILE" ]; then
+    # Локальный режим: копируем файл и проверяем имя
+    cp "$LOCAL_FILE" "$TMP"
+    echo "Скопировано из $LOCAL_FILE"
+else
+    # Онлайн-режим: скачиваем из GitHub Releases
+    URL="https://github.com/$REPO/releases/latest/download/$BINARY"
+    echo "Скачиваю $BINARY (таргет $TARGET) из $URL ..."
+    # busybox curl на Keenetic не следует за редиректами HTTPS.
+    # Скачиваем через GitHub API, который отдаёт прямой URL в JSON.
+    api_url="https://api.github.com/repos/$REPO/releases/latest"
+    raw_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -v bin="$BINARY" -F'"' '
+        /browser_download_url/ {
+            url = $0
+            # Извлекаем URL из найденной строки
+            match(url, /https:[^"]+/)
+            candidate = substr(url, RSTART, RLENGTH)
+            # Проверяем, что это нужный файл
+            if (index(candidate, bin) > 0) {
+                print candidate
+                exit
+            }
         }
+    ')
+    if [ -n "$raw_url" ]; then
+        URL="$raw_url"
+        echo "  -> resolved to $URL"
+    fi
+    curl -fsSL -o "$TMP" "$URL" || {
+        rm -f "$TMP"
+        echo "Ошибка: Не удалось скачать бинарник."
+        echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
+        echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
+        exit 1
     }
-')
-if [ -n "$raw_url" ]; then
-    URL="$raw_url"
-    echo "  -> resolved to $URL"
 fi
-curl -fsSL -o "$TMP" "$URL" || {
-    rm -f "$TMP"
-    echo "Ошибка: Не удалось скачать бинарник."
-    echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
-    exit 1
-}
 
-# Проверяем SHA256SUMS из релиза (если есть sha256sum на роутере)
-if command -v sha256sum >/dev/null 2>&1; then
+# 7. Проверяем SHA256SUMS из релиза (только для онлайн-установки)
+if [ -z "$LOCAL_FILE" ] && command -v sha256sum >/dev/null 2>&1; then
     sums_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -F'"' '
         /browser_download_url/ {
             url = $0
@@ -125,7 +145,7 @@ if command -v sha256sum >/dev/null 2>&1; then
     fi
 fi
 
-# Проверяем, что скачан ELF с нужным порядком байт. Без этого неверно
+# 8. Проверяем, что скачан ELF с нужным порядком байт. Без этого неверно
 # определённый таргет приводит к "syntax error: unexpected (": ядро
 # отказывает в exec (ENOEXEC), а busybox sh читает бинарник как скрипт.
 # Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
@@ -140,6 +160,7 @@ if [ "$magic" != "7f454c46" ]; then
     rm -f "$TMP"
     echo "Ошибка: скачанный файл не является ELF-бинарником (вероятно, скачалась HTML-страница с GitHub)."
     echo "Попробуйте вручную: curl -fsSL -L $URL -o /opt/sbin/doq-web"
+    echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
     exit 1
 fi
 if [ "$got" != "$want" ]; then
@@ -150,7 +171,7 @@ if [ "$got" != "$want" ]; then
 fi
 echo "ELF OK (endianness $got)"
 
-# Проверяем, что бинарник запускается
+# 9. Проверяем, что бинарник запускается
 "$TMP" -version >/dev/null 2>&1 || {
     rm -f "$TMP"
     echo "Ошибка: скачанный бинарник не запускается (возможно, не подходит для вашей архитектуры)."
