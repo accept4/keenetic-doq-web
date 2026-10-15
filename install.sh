@@ -54,7 +54,22 @@ detect_arch() {
 }
 
 TARGET=$(detect_arch)
-echo "Определённый таргет Entware: $TARGET"
+
+# opkg знает таргет Entware, но не знает, какие ELF умеет ядро. На 64-битных
+# SoC с 32-битным userspace (MT7622 в KeeneticOS) opkg печатает aarch64, а
+# ядро отвечает armv7l и отказывает в exec aarch64-ELF: ENOEXEC, и busybox
+# начинает читать бинарник как sh-скрипт. Для ARM-семейства вердикт ядра
+# важнее — он и решает, запустится файл или нет.
+kernel_m=$(uname -m 2>/dev/null)
+case "$kernel_m" in
+    armv7l|armv8l|armv6l)
+        if [ "$TARGET" = "aarch64-k3.10" ]; then
+            echo "Ядро 32-битное ($kernel_m) — беру armv7 вместо $TARGET"
+            TARGET="armv7sf-k3.2"
+        fi ;;
+esac
+
+echo "Таргет: $TARGET (Entware arch: $(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}'), ядро: ${kernel_m:-неизвестно})"
 
 # 5. Скачиваем бинарник из последней версии GitHub Releases
 # /tmp на роутерах — это tmpfs (RAM), поэтому скачиваем сразу в BIN_DIR,
