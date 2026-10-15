@@ -77,27 +77,31 @@ esac
 
 # 6. Вспомогательные функции скачивания и проверки.
 #
-# busybox curl на Keenetic не следует за HTTPS-редиректами (302 → 302 →
-# 302) без флага -L. Поэтому fetch() использует -L, а fetch_nol() — без.
+# --speed-limit/--speed-time обрывают "зависшее" соединение: если скорость
+# ниже 2 КБ/с держится 20 с — прервать. Файлы релизов GitHub отдаёт с
+# objects.githubusercontent.com после редиректа; когда этот хост недоступен
+# (DNS/TCP-фильтрация), curl без этих флагов молча висит до --max-time.
 #
 # GITHUB_TOKEN поднимает лимит GitHub API с 60 запросов в час на IP до 5000.
-# Без токена несколько установок подряд с одного белого IP (провайдерский NAT,
-# офис, несколько роутеров) упираются в "curl: (22) ... error: 403".
-fetch() { # $1 = url, $2 = файл — скачивание с -L (следовать редиректам)
+fetch() { # $1 = url, $2 = файл; показывает прогресс, обрыв при <2КБ/с 20с
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL --connect-timeout 10 --max-time 300 \
+        curl -fL --connect-timeout 10 --max-time 240 \
+            --speed-limit 2048 --speed-time 20 \
             -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
     else
-        curl -fsSL --connect-timeout 10 --max-time 300 -o "$2" "$1"
+        curl -fL --connect-timeout 10 --max-time 240 \
+            --speed-limit 2048 --speed-time 20 -o "$2" "$1"
     fi
 }
 
-fetch_nol() { # $1 = url, $2 = файл — без -L (на случай если URL не редиректит)
+fetch_q() { # то же, но тихо (для мелких служебных файлов)
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsS --connect-timeout 10 --max-time 300 \
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+            --speed-limit 2048 --speed-time 20 \
             -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
     else
-        curl -fsS --connect-timeout 10 --max-time 300 -o "$2" "$1"
+        curl -fsSL --connect-timeout 10 --max-time 60 \
+            --speed-limit 2048 --speed-time 20 -o "$2" "$1"
     fi
 }
 
@@ -135,13 +139,11 @@ else
     api_url="https://api.github.com/repos/$REPO/releases/latest"
     base_url="https://github.com/$REPO/releases/latest/download"
 
-    # JSON релиза берём ОДИН раз: из него и адрес бинарника, и адрес SHA256SUMS.
-    # Ответ пуст, если API недоступен или вернул 403 (лимит запросов) — тогда
-    # ставим по прямому адресу /releases/latest/download/, он отдельного
-    # лимита не имеет.
+    # JSON релиза берём ОДИН раз: из него адрес бинарника, адрес SHA256SUMS
+    # и тег (зеркала строятся от конкретного тега).
     rel_json=$(gh_json "$api_url" 2>/dev/null || true)
     if [ -z "$rel_json" ]; then
-        echo "GitHub API недоступен (403 — лимит 60 запросов/час на IP?) — качаю по прямому адресу."
+        echo "GitHub API недоступен (403/таймаут) — работаю без него."
     fi
 
     asset_url() { # $1 = имя файла в релизе
@@ -153,71 +155,71 @@ else
                 if (substr(u, length(u) - length(want) + 1) == want) { print u; exit }
             }'
     }
+    tag=$(printf '%s' "$rel_json" | awk -F'"' '/"tag_name"/ {print $4; exit}')
 
-    # busybox curl на Keenetic не следует за редиректами HTTPS, поэтому
-    # пробуем с -L (curl сам перейдёт по 302). Если не сработало —
-    # пробовать без -L (на случай если URL не редиректит).
-    SUMS_URL=""
-    URL=""
-    for nol in "" "nol"; do
-        for u in "$base_url/$BINARY" "$(asset_url "$BINARY")"; do
-            [ -n "$u" ] || continue
-            echo "Скачиваю $BINARY (таргет $TARGET): $u"
-            if [ "$nol" = "nol" ]; then
-                if ! fetch_nol "$u" "$TMP"; then
-                    echo "  -> curl без -L вернул код $?"
-                    continue
-                fi
-            else
-                if ! fetch "$u" "$TMP"; then
-                    echo "  -> curl с -L вернул код $?"
-                    continue
-                fi
-            fi
-            if is_elf "$TMP"; then
-                URL="$u"
-                echo "  -> OK (ELF, $(wc -c < "$TMP") байт)"
-                break 2
-            else
-                echo "  -> не ELF (скачалась страница ошибки GitHub), пробую"
-            fi
+    # 7a. Сначала мелкий SHA256SUMS: он и как тест доступности github.com,
+    # и как эталонный хеш. Скачивается за секунду — сразу видно, есть ли
+    # сеть до GitHub вообще, не дожидаясь 8-мегабайтной загрузки.
+    want_hash=""
+    sums_tmp="$BIN_DIR/$NAME.sums"
+    if command -v sha256sum >/dev/null 2>&1; then
+        SUMS_URL="$(asset_url SHA256SUMS)"
+        [ -n "$SUMS_URL" ] || SUMS_URL="$base_url/SHA256SUMS"
+        if fetch_q "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
+            want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
+            rm -f "$sums_tmp"
+            echo "SHA256SUMS получен, github.com доступен"
+        else
+            rm -f "$sums_tmp"
+            echo "SHA256SUMS недоступен — продолжаю без эталонного хеша"
+        fi
+    fi
+
+    # 7b. Кандидаты: github.com напрямую, адрес из API, затем зеркала.
+    # Зеркала — только при известном эталонном хеше: файл с зеркала принимается
+    # ТОЛЬКО после совпадения SHA256, иначе это канал подмены бинарника.
+    set -- "$base_url/$BINARY"
+    api_bin=$(asset_url "$BINARY")
+    [ -n "$api_bin" ] && set -- "$@" "$api_bin"
+    if [ -n "$want_hash" ] && [ -n "$tag" ]; then
+        for m in "https://ghfast.top" "https://gh-proxy.com" "https://ghproxy.net"; do
+            set -- "$@" "$m/https://github.com/$REPO/releases/download/$tag/$BINARY"
         done
+    fi
+
+    URL=""
+    for u in "$@"; do
+        echo "Скачиваю $BINARY: $u"
+        if ! fetch "$u" "$TMP"; then
+            rc=$?
+            echo "  -> curl код $rc (28/22 — сеть не тянет или файл недоступен, пробую дальше)"
+            continue
+        fi
+        if ! is_elf "$TMP"; then
+            echo "  -> это не ELF (страница ошибки вместо файла), пробую дальше"
+            continue
+        fi
+        if [ -n "$want_hash" ] && command -v sha256sum >/dev/null 2>&1; then
+            got_hash=$(sha256sum "$TMP" | awk '{print $1}')
+            if [ "$got_hash" != "$want_hash" ]; then
+                echo "  -> SHA256 не совпал, пробую дальше"
+                continue
+            fi
+            echo "SHA256 OK"
+        fi
+        URL="$u"
+        echo "  -> OK ($(wc -c < "$TMP") байт)"
+        break
     done
     [ -n "$URL" ] || {
         rm -f "$TMP"
-        echo "Ошибка: не удалось скачать бинарник."
-        echo "  Возможные причины:"
-        echo "  - Нет доступа к github.com (DNS, фаервол, прокси)"
-        echo "  - Нет сертификатов CA: opkg install ca-bundle"
-        echo "  - Лимит API GitHub (403): повторите позже"
-        echo "  - Файл слишком большой для RAM: шлем по частям"
+        echo "Ошибка: не удалось скачать бинарник ни напрямую, ни через зеркала."
+        echo "  - Проверьте: curl -fsSL https://github.com >/dev/null && echo ok"
+        echo "  - Ключение хоста objects.githubusercontent.com (файлы релизов)"
         echo "Офлайн-установка: скачайте файл на ПК и выполните"
         echo "  sh install.sh --local /tmp/$BINARY"
         exit 1
     }
-
-    # 8. Проверяем SHA256SUMS релиза (если sha256sum есть на роутере).
-    if command -v sha256sum >/dev/null 2>&1; then
-        SUMS_URL="$(asset_url SHA256SUMS)"
-        [ -n "$SUMS_URL" ] || SUMS_URL="$base_url/SHA256SUMS"
-        sums_tmp="$BIN_DIR/$NAME.sums"
-        if fetch_nol "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
-            want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
-            got_hash=$(sha256sum "$TMP" | awk '{print $1}')
-            rm -f "$sums_tmp"
-            if [ -n "$want_hash" ]; then
-                if [ "$got_hash" != "$want_hash" ]; then
-                    rm -f "$TMP"
-                    echo "Ошибка: SHA256 не совпадает (скачанный файл повреждён)."
-                    exit 1
-                fi
-                echo "SHA256 OK"
-            fi
-        else
-            rm -f "$sums_tmp"
-            echo "SHA256SUMS недоступен — проверку пропускаю"
-        fi
-    fi
 fi
 
 # 9. Проверяем ELF и порядок байт.
