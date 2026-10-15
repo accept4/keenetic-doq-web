@@ -23,33 +23,21 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # 3. Определяем архитектуру системы.
-# На Keenetic uname -m возвращает "mips" для обеихendianness.
-# Entware таргеты: mipselsf-k3.4, mipssf-k3.4, aarch64-k3.10, armv7sf-k3.2, armv5sf-k3.2
+# Entware (на котором держится весь установщик) точно знает свой таргет:
+# opkg print-architecture возвращает строки вроде aarch64-k3.10,
+# mipselsf-k3.4, mipssf-k3.4 и т.д. uname -m на Keenetic отдаёт "mips"
+# для обеих endian-ностей, а /proc/cpuinfo на части прошивок не содержит
+# слова "little" — отсюда KN-1810 (mipselsf) ошибочно уезжал в mipssf.
 detect_arch() {
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        aarch64|arm64)
-            echo "aarch64-k3.10" ;;
-        armv7l)
-            echo "armv7sf-k3.2" ;;
-        armv5*)
-            echo "armv5sf-k3.2" ;;
-        mipsel)
-            echo "mipselsf-k3.4" ;;
-        mips)
-            # Проверяемendianness через /proc/cpuinfo
-            if grep -qi 'little' /proc/cpuinfo 2>/dev/null; then
-                echo "mipselsf-k3.4"
-            else
-                echo "mipssf-k3.4"
-            fi
-            ;;
-        x86_64)
-            echo "x64-k3.2" ;;
-        *)
-            echo "Ошибка: Неподдерживаемая архитектура: $ARCH"
-            exit 1
-            ;;
+    arch=$(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}')
+    case "$arch" in
+        aarch64*|arm64*) echo "aarch64-k3.10" ;;
+        mipsel*)         echo "mipselsf-k3.4" ;;
+        mips*)           echo "mipssf-k3.4" ;;
+        armv7*)          echo "armv7sf-k3.2" ;;
+        armv5*)          echo "armv5sf-k3.2" ;;
+        x64*|x86_64*)    echo "x64-k3.2" ;;
+        *)               echo "Ошибка: неизвестный таргет Entware: $arch" >&2; exit 1 ;;
     esac
 }
 
@@ -80,6 +68,29 @@ curl -fsSL -o "$TMP" "$URL" || {
     echo "Проверьте интернет-соединение и наличие скомпилированного файла в GitHub Releases."
     exit 1
 }
+
+# Проверяем, что скачан ELF с нужным порядком байт. Без этого неверно
+# определённый таргет приводит к "syntax error: unexpected (": ядро
+# отказывает в exec (ENOEXEC), а busybox sh читает бинарник как скрипт.
+# Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
+want=01
+case "$TARGET" in
+    mipssf-k3.4) want=02 ;;
+esac
+magic=$(od -An -tx1 -N4 "$TMP" 2>/dev/null | tr -d ' \n')
+got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
+if [ "$magic" != "7f454c46" ]; then
+    rm -f "$TMP"
+    echo "Ошибка: скачанный файл не является ELF-бинарником (содержимое не то, что ожидалось)."
+    exit 1
+fi
+if [ "$got" != "$want" ]; then
+    rm -f "$TMP"
+    echo "Ошибка: порядок байт скачанного бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
+    echo "Проверьте вывод: opkg print-architecture"
+    exit 1
+fi
+echo "ELF OK (endianness $got)"
 
 # 5. Устанавливаем бинарный файл
 chmod +x "$TMP"
