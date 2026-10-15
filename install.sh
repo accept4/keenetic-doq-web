@@ -77,73 +77,111 @@ esac
 
 # 6. Скачиваем или копируем бинарник — как в upstream keenetic-doq.
 #
-# Единственный fetch: curl -fsSL. Никаких --speed-limit, --connect-timeout,
-# --max-time, API-запросов, raw-bins веток, зеркал. Одна команда — и файл
-# скачан. Редирект github.com → objects.githubusercontent.com работает через
-# -L (встроен в -fsSL).
+# busybox curl на Keenetic иногда не следует за HTTPS-редиректами (302) без
+# явного -L. Поэтому fetch() использует -f -S -L (раздельно).
+# Также проверяем размер скачанного файла: если < 1 МБ — это HTML-страница
+# ошибки, а не ELF-бинарник.
 fetch() { # $1 = url, $2 = output file
     if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+        curl -f -S -L -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
     else
-        curl -fsSL -o "$2" "$1"
+        curl -f -S -L -o "$2" "$1"
     fi
 }
 
 # Проверка ELF: неверно определённый таргет приводит к "syntax error:
 # unexpected (": ядро отказывает в exec (ENOEXEC), а busybox sh читает
 # бинарник как скрипт. Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
+#
+# Магию читаем через head -c, а не od -N/-j: busybox od понимает эти опции
+# не всегда, и на роутере проверка возвращала пустоту даже для валидного
+# файла (при уже совпавшем SHA256!).
 want=01
 case "$TARGET" in
     mipssf-k3.4)   want=02 ;;
     mips64sf-k5.0) want=02 ;;
 esac
 
-is_elf() { # $1 = файл, 0 если это ELF
-    [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+elf_magic() { # $1 = файл, печатает 4 байта магии hex или пусто
+    head -c 4 "$1" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' 	\n\r'
+}
+
+elf_endian() { # $1 = файл, печатает байт EI_DATA (01/02) или пусто
+    head -c 6 "$1" 2>/dev/null | tail -c 1 | od -An -tx1 2>/dev/null | tr -d ' 	\n\r'
 }
 
 if [ -n "$LOCAL_FILE" ]; then
     # Локальный режим: копируем файл, GitHub не трогаем.
     cp "$LOCAL_FILE" "$TMP"
     echo "Скопировано из $LOCAL_FILE"
+    hash_ok=""
 else
     base="https://github.com/$REPO/releases/latest/download"
     echo "Скачиваю $BINARY (таргет $TARGET)"
     fetch "$base/$BINARY" "$TMP" \
         || { rm -f "$TMP"; echo "Ошибка: download failed (нет сети? приватный репо? --local)"; exit 1; }
 
+    # Проверяем размер: бинарник должен быть > 1 МБ. Если меньше — это
+    # HTML-страница ошибки (404, 403 и т.д.), а не ELF-бинарник.
+    fsize=$(wc -c < "$TMP" 2>/dev/null || echo 0)
+    if [ "$fsize" -lt 1000000 ]; then
+        rm -f "$TMP"
+        echo "Ошибка: скачался маленький файл ($fsize байт) — это не бинарник."
+        echo "  Проверьте: curl -fSL $base/$BINARY"
+        echo "Офлайн-установка: скачайте файл на ПК и выполните"
+        echo "  sh install.sh --local /tmp/$BINARY"
+        exit 1
+    fi
+
     # SHA256SUMS — как в upstream: если sha256sum есть, проверяем.
+    # Совпавший SHA256 — достаточное доказательство подлинности и целости:
+    # он снимает и ELF-проверку, и проверку endianness (эталонный хеш
+    # соответствует заведомо нужному бинарнику).
+    hash_ok=""
     if command -v sha256sum >/dev/null 2>&1; then
         fetch "$base/SHA256SUMS" /opt/tmp/doq-web.sums \
             || { rm -f "$TMP"; echo "Ошибка: SHA256SUMS download failed"; exit 1; }
         want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' /opt/tmp/doq-web.sums)
         got_hash=$(sha256sum "$TMP" | awk '{print $1}')
         rm -f /opt/tmp/doq-web.sums
-        [ -n "$want_hash" ] && [ "$got_hash" = "$want_hash" ] \
+        if [ -z "$want_hash" ]; then
+            rm -f "$TMP"
+            echo "Ошибка: $BINARY не найден в SHA256SUMS (нет в релизе?)"
+            exit 1
+        fi
+        [ "$got_hash" = "$want_hash" ] \
             || { rm -f "$TMP"; echo "Ошибка: SHA256 mismatch — corrupted download"; exit 1; }
         echo "SHA256 OK"
+        hash_ok=1
     else
         echo "WARNING: sha256sum not found, skipping checksum"
     fi
 fi
 
-# 7. Проверяем ELF и порядок байт.
-if ! is_elf "$TMP"; then
-    rm -f "$TMP"
-    echo "Ошибка: файл не является ELF-бинарником."
-    echo "Офлайн-установка: sh install.sh --local /tmp/$BINARY"
-    exit 1
+# 7. ELF и порядок байт — только если SHA256 не подтвердил файл.
+if [ -z "$hash_ok" ]; then
+    magic=$(elf_magic "$TMP")
+    if [ "$magic" != "7f454c46" ]; then
+        rm -f "$TMP"
+        echo "Ошибка: файл не является ELF-бинарником (магия: '${magic:-пусто}', размер: $(wc -c < "$TMP" 2>/dev/null) байт)."
+        echo "  - Нет доступа к objects.githubusercontent.com (файлы релизов)"
+        echo "  - Файл не найден в релизе (проверьте, что тег опубликован)"
+        echo "Офлайн-установка: скачайте файл на ПК и выполните"
+        echo "  sh install.sh --local /tmp/$BINARY"
+        exit 1
+    fi
+    got=$(elf_endian "$TMP")
+    if [ -n "$got" ] && [ "$got" != "$want" ]; then
+        rm -f "$TMP"
+        echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
+        echo "Проверьте вывод: opkg print-architecture"
+        exit 1
+    fi
+    echo "ELF OK (endianness ${got:-не проверен})"
 fi
-got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
-if [ "$got" != "$want" ]; then
-    rm -f "$TMP"
-    echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
-    echo "Проверьте вывод: opkg print-architecture"
-    exit 1
-fi
-echo "ELF OK (endianness $got)"
 
-# 8. Проверяем, что бинарник запускается.
+# 8. Главная функциональная проверка: бинарник должен запуститься.
+# Именно она ловит "не та архитектура" надёжнее любых разборов заголовка.
 "$TMP" -version >/dev/null 2>&1 \
     || { rm -f "$TMP"; echo "Ошибка: бинарник не запускается (wrong architecture?)"; exit 1; }
 echo "Binary OK"
