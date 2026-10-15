@@ -70,6 +70,26 @@ jobs:
           go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips
           sha256sum doq-web-linux-mips >> SHA256SUMS
 
+      - name: Build Linux MIPS64LE (softfloat)
+        env:
+          GOOS: linux
+          GOARCH: mips64le
+          GOMIPS: softfloat
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips64le
+          sha256sum doq-web-linux-mips64le >> SHA256SUMS
+
+      - name: Build Linux MIPS64 (softfloat, big-endian)
+        env:
+          GOOS: linux
+          GOARCH: mips64
+          GOMIPS: softfloat
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips64
+          sha256sum doq-web-linux-mips64 >> SHA256SUMS
+
       - name: Build Linux ARM (v5)
         env:
           GOOS: linux
@@ -98,6 +118,8 @@ jobs:
             doq-web-linux-armv5
             doq-web-linux-mipsle
             doq-web-linux-mips
+            doq-web-linux-mips64le
+            doq-web-linux-mips64
             doq-web-linux-amd64
             SHA256SUMS
           draft: ${{ github.event.inputs.draft }}

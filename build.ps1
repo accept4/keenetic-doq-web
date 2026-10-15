@@ -25,6 +25,18 @@ go build -ldflags="-s -w" -o dist/doq-web-linux-mips .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mips"
 
+# linux/mips64le softfloat (OpenWRT mips64el, Entware mips64r6el)
+$env:GOARCH = "mips64le"; $env:GOMIPS = "softfloat"
+go build -ldflags="-s -w" -o dist/doq-web-linux-mips64le .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips64le"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-mips64le"
+
+# linux/mips64 softfloat big-endian (OpenWRT mips64)
+$env:GOARCH = "mips64"; $env:GOMIPS = "softfloat"
+go build -ldflags="-s -w" -o dist/doq-web-linux-mips64 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips64"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-mips64"
+
 # linux/amd64 (Entware x64-k3.2, отладка на ПК)
 $env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:GOMIPS = ""
 go build -ldflags="-s -w" -o dist/doq-web-linux-amd64 .

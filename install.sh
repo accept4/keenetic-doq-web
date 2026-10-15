@@ -32,6 +32,8 @@ detect_arch() {
     arch=$(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}')
     case "$arch" in
         aarch64*|arm64*) echo "aarch64-k3.10" ;;
+        mips64r6*|mips64*el*) echo "mips64elsf-k5.0" ;;
+        mips64*)         echo "mips64sf-k5.0" ;;
         mipsel*)         echo "mipselsf-k3.4" ;;
         mips*)           echo "mipssf-k3.4" ;;
         armv7*)          echo "armv7sf-k3.2" ;;
@@ -51,13 +53,15 @@ mkdir -p "$BIN_DIR"
 TMP="$BIN_DIR/$NAME.part"
 # Бинарники собираются под конкретный таргет, имя соответствует архитектуре.
 case "$TARGET" in
-    aarch64-k3.10)    BINARY="doq-web-linux-arm64" ;;
-    armv7sf-k3.2)     BINARY="doq-web-linux-arm" ;;
-    armv5sf-k3.2)     BINARY="doq-web-linux-armv5" ;;
-    mipselsf-k3.4)    BINARY="doq-web-linux-mipsle" ;;
-    mipssf-k3.4)      BINARY="doq-web-linux-mips" ;;
-    x64-k3.2)         BINARY="doq-web-linux-amd64" ;;
-    *)                BINARY="doq-web-linux-mipsle" ;;
+    aarch64-k3.10)       BINARY="doq-web-linux-arm64" ;;
+    armv7sf-k3.2)        BINARY="doq-web-linux-arm" ;;
+    armv5sf-k3.2)        BINARY="doq-web-linux-armv5" ;;
+    mips64elsf-k5.0)     BINARY="doq-web-linux-mips64le" ;;
+    mips64sf-k5.0)       BINARY="doq-web-linux-mips64" ;;
+    mipselsf-k3.4)       BINARY="doq-web-linux-mipsle" ;;
+    mipssf-k3.4)         BINARY="doq-web-linux-mips" ;;
+    x64-k3.2)            BINARY="doq-web-linux-amd64" ;;
+    *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
 URL="https://github.com/$REPO/releases/latest/download/$BINARY"
 
@@ -95,7 +99,8 @@ curl -fsSL -o "$TMP" "$URL" || {
 # Байт 5 (0-based) ELF-заголовка: 01 = little, 02 = big.
 want=01
 case "$TARGET" in
-    mipssf-k3.4) want=02 ;;
+    mipssf-k3.4)       want=02 ;;
+    mips64sf-k5.0)     want=02 ;;
 esac
 magic=$(od -An -tx1 -N4 "$TMP" 2>/dev/null | tr -d ' \n')
 got=$(od -An -tx1 -j5 -N1 "$TMP" 2>/dev/null | tr -d ' \n')
