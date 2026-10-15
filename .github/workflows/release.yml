@@ -26,7 +26,7 @@ jobs:
           cache: true
 
       - name: Verify build
-        run: go build -trimpath -ldflags="-s -w" -o /dev/null .
+        run: go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o /dev/null .
 
       - name: Test
         run: go test -v -count=1 ./...
@@ -37,7 +37,7 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-arm64
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-arm64
           sha256sum doq-web-linux-arm64 >> SHA256SUMS
 
       - name: Build Linux ARM (v7)
@@ -47,7 +47,7 @@ jobs:
           GOARM: 7
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-arm
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-arm
           sha256sum doq-web-linux-arm >> SHA256SUMS
 
       - name: Build Linux MIPSLE (softfloat)
@@ -57,7 +57,7 @@ jobs:
           GOMIPS: softfloat
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mipsle
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-mipsle
           sha256sum doq-web-linux-mipsle >> SHA256SUMS
 
       - name: Build Linux MIPS (softfloat, big-endian)
@@ -67,7 +67,7 @@ jobs:
           GOMIPS: softfloat
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-mips
           sha256sum doq-web-linux-mips >> SHA256SUMS
 
       - name: Build Linux MIPS64LE (softfloat)
@@ -77,7 +77,7 @@ jobs:
           GOMIPS: softfloat
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips64le
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-mips64le
           sha256sum doq-web-linux-mips64le >> SHA256SUMS
 
       - name: Build Linux MIPS64 (softfloat, big-endian)
@@ -87,7 +87,7 @@ jobs:
           GOMIPS: softfloat
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-mips64
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-mips64
           sha256sum doq-web-linux-mips64 >> SHA256SUMS
 
       - name: Build Linux ARM (v5)
@@ -97,7 +97,7 @@ jobs:
           GOARM: 5
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-armv5
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-armv5
           sha256sum doq-web-linux-armv5 >> SHA256SUMS
 
       - name: Build Linux AMD64
@@ -106,7 +106,7 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o doq-web-linux-amd64
+          go build -trimpath -ldflags="-s -w -X main.webVersion=${GITHUB_REF_NAME}" -o doq-web-linux-amd64
           sha256sum doq-web-linux-amd64 >> SHA256SUMS
 
       - name: Create Release
