@@ -180,12 +180,25 @@ fi
 
 # 8. Бинарник должен запуститься: -version печатает версию и выходит.
 # Именно эта проверка ловит "не та архитектура" надёжнее разбора заголовков.
-"$TMP" -version >/dev/null 2>&1 \
-    || { rm -f "$TMP"; echo "Ошибка: бинарник не запускается (wrong architecture?)"; exit 1; }
-echo "Binary OK"
+#
+# chmod +x ОБЯЗАТЕЛЕН до проверки: curl -o создаёт файл с правами 664/644 без
+# бита исполнения, и запуск вернул бы "Permission denied", что иначе
+# ошибочно читается как "wrong architecture".
+chmod +x "$TMP"
+if ver_out=$("$TMP" -version 2>&1); then
+    echo "Binary OK: $ver_out"
+else
+    echo "Ошибка: бинарник не запускается (код $?): ${ver_out:-нет вывода}"
+    echo "  размер: $(wc -c < "$TMP" 2>/dev/null) байт, магия: $(elf_magic "$TMP")"
+    echo "  права: $(ls -l "$TMP" 2>/dev/null)"
+    echo "  монтирование /opt: $(mount 2>/dev/null | grep ' /opt ' || echo 'не найдено')"
+    echo "Если в строке монтирования есть noexec — /opt нельзя исполнять,"
+    echo "скопируйте бинарник в другую partition или перемонтируйте /opt."
+    rm -f "$TMP"
+    exit 1
+fi
 
 # 9. Устанавливаем бинарный файл
-chmod +x "$TMP"
 mv "$TMP" "$BIN_DIR/$NAME"
 sync
 echo "Установлен бинарник: $BIN_DIR/$NAME"
