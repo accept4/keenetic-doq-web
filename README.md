@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/insta
 
 ```sh
 # Скопируйте бинарник на роутер, затем:
-sh install.sh --local /tmp/doq-web-linux-mipsle
+sh install.sh --local /tmp/doq-web-linux....
 ```
 
 ### Удаление
