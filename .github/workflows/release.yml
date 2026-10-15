@@ -127,3 +127,19 @@ jobs:
           overwrite: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish binaries to raw-bins branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -rf /tmp/raw-bins
+          mkdir -p /tmp/raw-bins && cd /tmp/raw-bins
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cp "${{ github.workspace }}/doq-web-linux-*" "${{ github.workspace }}/SHA256SUMS" .
+          git checkout --orphan main
+          git rm -rf . 2>/dev/null || true
+          git add -A
+          git commit -q -m "bins"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" main:raw-bins

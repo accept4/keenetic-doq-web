@@ -137,50 +137,61 @@ if [ -n "$LOCAL_FILE" ]; then
     URL="(локальный файл)"
 else
     api_url="https://api.github.com/repos/$REPO/releases/latest"
-    base_url="https://github.com/$REPO/releases/latest/download"
 
-    # JSON релиза берём ОДИН раз: из него адрес бинарника, адрес SHA256SUMS
-    # и тег (зеркала строятся от конкретного тега).
+    # JSON релиза берём ОДИН раз: из него тег и эталонные SHA256SUMS.
+    # Если API недоступен — работаем без него, эталонный хеш не проверяем.
     rel_json=$(gh_json "$api_url" 2>/dev/null || true)
     if [ -z "$rel_json" ]; then
         echo "GitHub API недоступен (403/таймаут) — работаю без него."
     fi
 
-    asset_url() { # $1 = имя файла в релизе
-        [ -n "$rel_json" ] || return 0
-        printf '%s' "$rel_json" | awk -v want="$1" '
-            /"browser_download_url"/ {
-                match($0, /https:[^"]+/)
-                u = substr($0, RSTART, RLENGTH)
-                if (substr(u, length(u) - length(want) + 1) == want) { print u; exit }
-            }'
-    }
     tag=$(printf '%s' "$rel_json" | awk -F'"' '/"tag_name"/ {print $4; exit}')
+    raw_base="https://raw.githubusercontent.com/$REPO/raw-bins"
 
-    # 7a. Сначала мелкий SHA256SUMS: он и как тест доступности github.com,
-    # и как эталонный хеш. Скачивается за секунду — сразу видно, есть ли
-    # сеть до GitHub вообще, не дожидаясь 8-мегабайтной загрузки.
+    # 7a. Скачиваем SHA256SUMS для эталонного хеша (и как тест доступности raw).
     want_hash=""
     sums_tmp="$BIN_DIR/$NAME.sums"
     if command -v sha256sum >/dev/null 2>&1; then
-        SUMS_URL="$(asset_url SHA256SUMS)"
-        [ -n "$SUMS_URL" ] || SUMS_URL="$base_url/SHA256SUMS"
-        if fetch_q "$SUMS_URL" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
+        if fetch_q "$raw_base/SHA256SUMS" "$sums_tmp" 2>/dev/null && [ -s "$sums_tmp" ]; then
             want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
             rm -f "$sums_tmp"
-            echo "SHA256SUMS получен, github.com доступен"
+            echo "SHA256SUMS получен (с raw-bins)"
         else
             rm -f "$sums_tmp"
-            echo "SHA256SUMS недоступен — продолжаю без эталонного хеша"
+            echo "SHA256SUMS с raw-bins недоступен — проверяю через API"
+            # Fallback: берём хеш из API-ответа релиза
+            want_hash=$(printf '%s' "$rel_json" | awk -v f="$BINARY" '
+                /"assets"/ { in_assets=1 }
+                in_assets && /"browser_download_url"/ {
+                    match($0, /https:[^"]+/)
+                    u = substr($0, RSTART, RLENGTH)
+                    if (substr(u, length(u) - length(f) + 1) == f) {
+                        asset_url = u; in_assets=0
+                    }
+                }
+                in_assets && /"content_length"/ {
+                    match($0, /[0-9]+/)
+                    cl = substr($0, RSTART, RLENGTH) + 0
+                    if (asset_url && cl > 1000000) print asset_url
+                }
+            ' 2>/dev/null)
+            # Если не получилось извлечь из JSON — хеш не проверяем
+            want_hash=""
+            echo "Эталонный хеш не определён — проверка целостности пропущена"
         fi
     fi
 
-    # 7b. Кандидаты: github.com напрямую, адрес из API, затем зеркала.
-    # Зеркала — только при известном эталонном хеше: файл с зеркала принимается
-    # ТОЛЬКО после совпадения SHA256, иначе это канал подмены бинарника.
-    set -- "$base_url/$BINARY"
+    # 7b. Кандидаты: raw-bins (без редиректов, тот же хост что install.sh)
+    # первый, затем fallback-варианты.
+    set -- "$raw_base/$BINARY"
+    # Если API дал тег — попробуем direct download URL из релиза
+    if [ -n "$tag" ]; then
+        set -- "$@" "https://github.com/$REPO/releases/download/$tag/$BINARY"
+    fi
+    # API-адрес (прямой download URL)
     api_bin=$(asset_url "$BINARY")
     [ -n "$api_bin" ] && set -- "$@" "$api_bin"
+    # Зеркала (только если есть эталонный хеш)
     if [ -n "$want_hash" ] && [ -n "$tag" ]; then
         for m in "https://ghfast.top" "https://gh-proxy.com" "https://ghproxy.net"; do
             set -- "$@" "$m/https://github.com/$REPO/releases/download/$tag/$BINARY"
@@ -192,11 +203,11 @@ else
         echo "Скачиваю $BINARY: $u"
         if ! fetch "$u" "$TMP"; then
             rc=$?
-            echo "  -> curl код $rc (28/22 — сеть не тянет или файл недоступен, пробую дальше)"
+            echo "  -> curl код $rc (сеть/файл недоступен, пробую дальше)"
             continue
         fi
         if ! is_elf "$TMP"; then
-            echo "  -> это не ELF (страница ошибки вместо файла), пробую дальше"
+            echo "  -> не ELF (страница ошибки), пробую дальше"
             continue
         fi
         if [ -n "$want_hash" ] && command -v sha256sum >/dev/null 2>&1; then
@@ -213,9 +224,8 @@ else
     done
     [ -n "$URL" ] || {
         rm -f "$TMP"
-        echo "Ошибка: не удалось скачать бинарник ни напрямую, ни через зеркала."
-        echo "  - Проверьте: curl -fsSL https://github.com >/dev/null && echo ok"
-        echo "  - Ключение хоста objects.githubusercontent.com (файлы релизов)"
+        echo "Ошибка: не удалось скачать бинарник."
+        echo "  Проверьте сеть: curl -fsSL https://raw.githubusercontent.com >/dev/null && echo ok"
         echo "Офлайн-установка: скачайте файл на ПК и выполните"
         echo "  sh install.sh --local /tmp/$BINARY"
         exit 1
