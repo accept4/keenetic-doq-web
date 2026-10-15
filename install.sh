@@ -93,6 +93,38 @@ curl -fsSL -o "$TMP" "$URL" || {
     exit 1
 }
 
+# Проверяем SHA256SUMS из релиза (если есть sha256sum на роутере)
+if command -v sha256sum >/dev/null 2>&1; then
+    sums_url=$(curl -fsSL "$api_url" 2>/dev/null | awk -F'"' '
+        /browser_download_url/ {
+            url = $0
+            match(url, /https:[^"]+/)
+            candidate = substr(url, RSTART, RLENGTH)
+            if (index(candidate, "SHA256SUMS") > 0) {
+                print candidate
+                exit
+            }
+        }
+    ')
+    if [ -n "$sums_url" ]; then
+        sums_tmp="$BIN_DIR/$NAME.sums"
+        curl -fsSL -o "$sums_tmp" "$sums_url" 2>/dev/null || true
+        if [ -f "$sums_tmp" ]; then
+            want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' "$sums_tmp")
+            got_hash=$(sha256sum "$TMP" | awk '{print $1}')
+            rm -f "$sums_tmp"
+            if [ -n "$want_hash" ] && [ "$got_hash" != "$want_hash" ]; then
+                rm -f "$TMP"
+                echo "Ошибка: SHA256 не совпадает (скачанный файл повреждён)."
+                exit 1
+            fi
+            if [ -n "$want_hash" ]; then
+                echo "SHA256 OK"
+            fi
+        fi
+    fi
+fi
+
 # Проверяем, что скачан ELF с нужным порядком байт. Без этого неверно
 # определённый таргет приводит к "syntax error: unexpected (": ядро
 # отказывает в exec (ENOEXEC), а busybox sh читает бинарник как скрипт.
@@ -117,6 +149,14 @@ if [ "$got" != "$want" ]; then
     exit 1
 fi
 echo "ELF OK (endianness $got)"
+
+# Проверяем, что бинарник запускается
+"$TMP" -version >/dev/null 2>&1 || {
+    rm -f "$TMP"
+    echo "Ошибка: скачанный бинарник не запускается (возможно, не подходит для вашей архитектуры)."
+    exit 1
+}
+echo "Binary OK"
 
 # 5. Устанавливаем бинарный файл
 chmod +x "$TMP"
