@@ -46,9 +46,46 @@ const (
 //     анонимных запросов 60/ч с одного IP).
 const (
 	upstreamRepo    = "necronicle/keenetic-doq"
-	versionFile     = "/opt/etc/doq-web/version.txt"
 	latestRefreshIt = 6 * time.Hour
 )
+
+// Пути и установщик doqd зависят от платформы: на Keenetic всё живёт в
+// Entware (/opt), на OpenWRT апстрим ставит демона в /usr/sbin, конфиг в
+// /etc/doqd.conf, а автозапуск — procd-скрипт /etc/init.d/doqd. Платформа
+// определяется по /etc/openwrt_release, которого на KeeneticOS нет.
+var (
+	doqdConfPath    = "/opt/etc/doqd.conf"
+	doqdInitScript  = "/opt/etc/init.d/S56doqd"
+	doqdBinary      = "/opt/sbin/doqd"
+	doqdInstaller   = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+	versionFile     = "/opt/etc/doq-web/version.txt"
+	customHostsPath = "/opt/etc/doqd.hosts"
+)
+
+func init() {
+	_, err := os.Stat("/etc/openwrt_release")
+	applyPlatform(err == nil)
+}
+
+// applyPlatform выставляет пути под платформу. Вынесено из init() и
+// принимает явный флаг — тесты могут проверить обе платформы на любом хосте.
+func applyPlatform(openwrt bool) {
+	if !openwrt {
+		doqdConfPath = "/opt/etc/doqd.conf"
+		doqdInitScript = "/opt/etc/init.d/S56doqd"
+		doqdBinary = "/opt/sbin/doqd"
+		doqdInstaller = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+		versionFile = "/opt/etc/doq-web/version.txt"
+		customHostsPath = "/opt/etc/doqd.hosts"
+		return
+	}
+	doqdConfPath = "/etc/doqd.conf"
+	doqdInitScript = "/etc/init.d/doqd"
+	doqdBinary = "/usr/sbin/doqd"
+	doqdInstaller = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install-openwrt.sh"
+	versionFile = "/etc/doq-web/version.txt"
+	customHostsPath = "/etc/doqd/hosts"
+}
 
 // webVersion — версия самой панели; подставляется при сборке через
 // -ldflags "-X main.webVersion=v1.0.x". Флаг -version отдаёт её установщику.
@@ -354,8 +391,8 @@ func page(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// pageHTML — СТРОКА ФОРМАТА (в ней %[1]s, %[7]d и 50%%). Раньше здесь
-	// стоял w.Write(pageHTML), который сливал в браузер сырой шаблон:
+	// pageHTML — СТРОКА ФОРМАТА (в ней %[1]s, %[7]d, %[8]s и 50%%). Раньше
+	// здесь стоял w.Write(pageHTML), который сливал в браузер сырой шаблон:
 	// пользователь видел литералы "%[1]s" вместо статуса.
 	if _, err := fmt.Fprintf(w, pageHTML,
 		dot,
@@ -365,6 +402,7 @@ func page(w http.ResponseWriter, r *http.Request) {
 		html.EscapeString(status),
 		html.EscapeString(list),
 		age,
+		html.EscapeString(customHostsPath),
 	); err != nil {
 		log.Printf("render: %v", err)
 	}
@@ -433,12 +471,9 @@ func test(w http.ResponseWriter, r *http.Request) {
 // полностью заменяет встроенный снимок; SIGHUP (doqd hosts reload)
 // перечитывает его атомарно, ошибочный файл не применяется.
 
-// doqdConfPath — конфиг doqd на Keenetic. Переменная, а не константа:
-// тесты подменяют её на временный файл.
-var doqdConfPath = "/opt/etc/doqd.conf"
-
-// customHostsPath — куда экспортим встроенный снимок при создании своего файла.
-const customHostsPath = "/opt/etc/doqd.hosts"
+// doqdConfPath, customHostsPath и versionFile объявлены в начале файла и
+// зависят от платформы (Keenetic — /opt, OpenWRT — /etc). doqdConfPath —
+// переменная: тесты подменяют её на временный файл.
 
 // hostsEditMax — потолок размера hosts-файла в редакторе. Встроенный снимок
 // ~1025 имён (< 100 КБ); 256 КБ с запасом, и protects RAM/flash на роутере.
@@ -576,9 +611,11 @@ func hostsEnableCustom(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	// Пути константы — шелл здесь только для редиректа вывода.
+	// Пути задаёт платформа — шелл здесь только для редиректа вывода.
+	// mkdir нужен на OpenWRT: каталог /etc/doqd апстрим создаёт только если
+	// пользователь сам его завёл (см. README апстрима, «Свой hosts»).
 	out, err := exec.CommandContext(ctx, "sh", "-c",
-		"doqd hosts export > "+customHostsPath+".tmp && [ -s "+customHostsPath+".tmp ] && mv "+customHostsPath+".tmp "+customHostsPath).CombinedOutput()
+		"mkdir -p $(dirname "+customHostsPath+") && doqd hosts export > "+customHostsPath+".tmp && [ -s "+customHostsPath+".tmp ] && mv "+customHostsPath+".tmp "+customHostsPath).CombinedOutput()
 	if err != nil {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка экспорта: "+stripANSI(string(out))+"\n"+err.Error()), 303)
 		return
@@ -587,7 +624,7 @@ func hostsEnableCustom(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
 		return
 	}
-	restartOut := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Свой hosts включён ("+customHostsPath+"), демон перезапущен:\n"+restartOut), 303)
 }
@@ -599,25 +636,25 @@ func hostsDisableCustom(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
 		return
 	}
-	restartOut := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Включён встроенный hosts, демон перезапущен:\n"+restartOut), 303)
 }
 
 func restart(w http.ResponseWriter, r *http.Request) {
-	out := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
+	out := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Restart:\n"+out), 303)
 }
 
 func stop(w http.ResponseWriter, r *http.Request) {
-	out := controlOutput(run("/opt/etc/init.d/S56doqd", "stop"))
+	out := controlOutput(run(doqdInitScript, "stop"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Stop:\n"+out), 303)
 }
 
 func start(w http.ResponseWriter, r *http.Request) {
-	out := controlOutput(run("/opt/etc/init.d/S56doqd", "start"))
+	out := controlOutput(run(doqdInitScript, "start"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Start:\n"+out), 303)
 }
@@ -717,9 +754,10 @@ func statusAPI(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// installed — признаки установки keenetic-doq по файлам инсталлера.
+// installed — признаки установки keenetic-doq по файлам инсталлера. Пути
+// платформенные: Keenetic — /opt, OpenWRT — /etc и /usr/sbin.
 func installed() bool {
-	for _, p := range []string{"/opt/sbin/doqd", "/opt/etc/doqd.conf", "/opt/etc/init.d/S56doqd"} {
+	for _, p := range []string{doqdBinary, doqdConfPath, doqdInitScript} {
 		if _, err := os.Stat(p); err != nil {
 			return false
 		}
@@ -727,18 +765,19 @@ func installed() bool {
 	return true
 }
 
-// install ставит keenetic-doq одной командой. Отдельный exec, а не run():
-// тут нужен именно шелл, потому что команда — пайп curl | sh.
-func install(w http.ResponseWriter, r *http.Request) {
-	// Серверный WriteTimeout = 20s, установка — до 3 минут. Без этого
-	// редирект с результатом не дописался бы: дедлайн истёк бы во время
-	// exec.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(4 * time.Minute))
-
-	const src = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+// runUpstreamInstaller скачивает и выполняет установщик doqd для текущей
+// платформы: на Keenetic это install.sh апстрима, на OpenWRT —
+// install-openwrt.sh. На Keenetic curl обязателен (busybox-wget без TLS), на
+// OpenWRT штатный uclient-fetch умеет https, поэтому там допускается wget.
+// Возвращает текст вывода со встроенной ошибкой, если что-то пошло не так.
+func runUpstreamInstaller() string {
+	script := "curl -fsSL " + doqdInstaller
+	if _, err := exec.LookPath("curl"); err != nil {
+		script = "wget -qO- " + doqdInstaller
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "sh", "-c", "curl -fsSL "+src+" | sh").CombinedOutput()
+	out, err := exec.CommandContext(ctx, "sh", "-c", script+" | sh").CombinedOutput()
 	if len(out) > maxOutput {
 		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
 	}
@@ -749,8 +788,20 @@ func install(w http.ResponseWriter, r *http.Request) {
 		}
 		text += err.Error()
 	}
-	requestRefreshAfter(refreshAfterRestart)
 	saveInstalledDoqdVersion()
+	return text
+}
+
+// install ставит keenetic-doq одной командой. Отдельный exec, а не run():
+// тут нужен именно шелл, потому что команда — пайп curl | sh.
+func install(w http.ResponseWriter, r *http.Request) {
+	// Серверный WriteTimeout = 20s, установка — до 3 минут. Без этого
+	// редирект с результатом не дописался бы: дедлайн истёк бы во время
+	// exec.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(4 * time.Minute))
+
+	text := runUpstreamInstaller()
+	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Установка:\n"+text), 303)
 }
 
@@ -763,22 +814,8 @@ func update(w http.ResponseWriter, r *http.Request) {
 	// exec.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(4 * time.Minute))
 
-	const src = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "sh", "-c", "curl -fsSL "+src+" | sh").CombinedOutput()
-	if len(out) > maxOutput {
-		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
-	}
-	text := strings.TrimSpace(stripANSI(string(out)))
-	if err != nil {
-		if text != "" {
-			text += "\n"
-		}
-		text += err.Error()
-	}
+	text := runUpstreamInstaller()
 	requestRefreshAfter(refreshAfterRestart)
-	saveInstalledDoqdVersion()
 	http.Redirect(w, r, "/?msg="+encode("Обновление:\n"+text), 303)
 }
 
@@ -1204,7 +1241,7 @@ const pageHTML = `
   loadHosts();
   if (enableF) {
     enableF.addEventListener('submit', function (e) {
-      if (!window.confirm('Экспортировать встроенный снимок в /opt/etc/doqd.hosts\nи переключить doqd на свой файл?\n\nДемон будет перезапущен.')) {
+      if (!window.confirm('Экспортировать встроенный снимок в %[8]s\nи переключить doqd на свой файл?\n\nДемон будет перезапущен.')) {
         e.preventDefault();
       }
     });

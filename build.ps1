@@ -1,9 +1,9 @@
-﻿$env:CGO_ENABLED = "0"
+$env:CGO_ENABLED = "0"
 $env:GOFLAGS = "-trimpath"
 
 # Версия панели подшивается в main.webVersion — её отдаёт `doq-web -version`,
 # которым install.sh проверяет, что бинарник запускается на данной архитектуре.
-$VER = "v1.1.0"
+$VER = "v1.2.0"
 $LDF = "-ldflags=-s -w -X main.webVersion=$VER"
 
 # linux/arm64 (Keenetic Giga KN-1010, Ultra KN-1811 — aarch64)

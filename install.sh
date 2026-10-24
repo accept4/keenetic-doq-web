@@ -2,20 +2,36 @@
 set -e
 
 REPO="accept4/keenetic-doq-web"
-BIN_DIR="/opt/sbin"
-INIT_DIR="/opt/etc/init.d"
 NAME="doq-web"
 
 echo "=== keenetic-doq-web installer ==="
 
-# 1. Проверяем наличие Entware
-if [ ! -d "/opt/bin" ] && [ ! -d "/opt/sbin" ]; then
+# 1. Платформа. /etc/openwrt_release существует только на OpenWRT: там нет
+# Entware, бинарники лежат в /usr/sbin, конфиги в /etc, автозапуск — procd.
+# На Keenetic наоборот, вся среда — Entware в /opt. Пути панели здесь;
+# пути doqd панель сама различает в рантайме по тому же файлу.
+if [ -f /etc/openwrt_release ]; then
+    PLATFORM="openwrt"
+    BIN_DIR="/usr/sbin"
+    INIT_DIR="/etc/init.d"
+    SVC="$INIT_DIR/doq-web"
+else
+    PLATFORM="keenetic"
+    BIN_DIR="/opt/sbin"
+    INIT_DIR="/opt/etc/init.d"
+    SVC="$INIT_DIR/S57doq-web"
+fi
+echo "Платформа: $PLATFORM"
+
+# 2. Entware обязателен только на Keenetic: там он и среда исполнения, и
+# источник архитектуры (opkg). На OpenWRT всё нужное есть в прошивке.
+if [ "$PLATFORM" = "keenetic" ] && [ ! -d "/opt/bin" ] && [ ! -d "/opt/sbin" ]; then
     echo "Ошибка: Среда Entware не обнаружена в /opt!"
     echo "Установите Entware на роутер перед запуском скрипта."
     exit 1
 fi
 
-# 2. Поддержка --local режима (установка из локального файла)
+# 3. Поддержка --local режима (установка из локального файла)
 LOCAL_FILE=""
 if [ "$1" = "--local" ]; then
     [ -n "$2" ] || { echo "Ошибка: укажите путь к бинарнику: sh install.sh --local ./doq-web-linux-<arch>"; exit 1; }
@@ -24,23 +40,62 @@ if [ "$1" = "--local" ]; then
     echo "Режим --local: устанавливаем из $LOCAL_FILE"
 fi
 
-# 3. Проверяем утилиту curl (нужна только для онлайн-установки)
-if [ -z "$LOCAL_FILE" ] && ! command -v curl >/dev/null 2>&1; then
-    echo "Ошибка: curl не установлен!"
-    echo "Установите его командой: opkg update && opkg install curl"
-    echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
-    exit 1
+# 4. Чем качать. На Keenetic busybox-wget собран без TLS — там строго curl.
+# На OpenWRT штатный uclient-fetch (алиас wget) умеет https, curl опционален.
+DL="curl"
+if [ -z "$LOCAL_FILE" ]; then
+    if command -v curl >/dev/null 2>&1; then
+        DL="curl"
+    elif [ "$PLATFORM" = "openwrt" ] && command -v wget >/dev/null 2>&1; then
+        DL="wget"
+    else
+        echo "Ошибка: curl не установлен!"
+        echo "Установите его командой: opkg update && opkg install curl"
+        echo "Или используйте локальный режим: sh install.sh --local ./doq-web-linux-<arch>"
+        exit 1
+    fi
 fi
 
-# 4. Определяем архитектуру системы.
-# Entware (на котором держится весь установщик) точно знает свой таргет:
-# opkg print-architecture возвращает строки вроде aarch64-k3.10,
-# mipselsf-k3.4, mipssf-k3.4 и т.д. uname -m на Keenetic отдаёт "mips"
-# для обеих endian-ностей, а /proc/cpuinfo на части прошивок не содержит
-# слова "little" — отсюда KN-1810 (mipselsf) ошибочно уезжал в mipssf.
+fetch() { # $1 = url, $2 = output file
+    if [ "$DL" = "wget" ]; then
+        wget -qO "$2" "$1"
+    elif [ -n "$GITHUB_TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
+    else
+        curl -fsSL -o "$2" "$1"
+    fi
+}
+
+# 5. Определяем архитектуру.
+# Keenetic: Entware точно знает свой таргет — opkg print-architecture
+# возвращает aarch64-k3.10, mipselsf-k3.4, mipssf-k3.4 и т.д. uname -m на
+# Keenetic отдаёт "mips" для обеих endian-ностей, а /proc/cpuinfo на части
+# прошивок не содержит "little" — отсюда KN-1810 (mipselsf) ошибочно
+# уезжал в mipssf.
+# OpenWRT: DISTRIB_ARCH из /etc/openwrt_release — тот же источник, что у
+# апстримового install-openwrt.sh для doqd. Имена таргетов совпадают с
+# Entware, чтобы остальной скрипт не ветвился.
 detect_arch() {
-    arch=$(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}')
-    case "$arch" in
+    if [ "$PLATFORM" = "openwrt" ]; then
+        . /etc/openwrt_release
+        RAW_ARCH="$DISTRIB_ARCH"
+        case "$DISTRIB_ARCH" in
+            aarch64*) echo "aarch64-k3.10" ;;
+            mips64el*) echo "mips64elsf-k5.0" ;;
+            mips64*)   echo "mips64sf-k5.0" ;;
+            mipsel*)   echo "mipselsf-k3.4" ;;
+            mips*)     echo "mipssf-k3.4" ;;
+            arm_cortex-a*_neon*|arm_cortex-a*_vfp*) echo "armv7sf-k3.2" ;;
+            arm*)      echo "armv5sf-k3.2" ;;
+            x86_64*)   echo "x64-k3.2" ;;
+            *)         echo "Ошибка: неизвестная архитектура OpenWRT: $DISTRIB_ARCH" >&2
+                       echo "Go не собирает панели под эту платформу — используйте --local." >&2
+                       exit 1 ;;
+        esac
+        return
+    fi
+    RAW_ARCH=$(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}')
+    case "$RAW_ARCH" in
         aarch64*|arm64*) echo "aarch64-k3.10" ;;
         mips64r6*|mips64*el*) echo "mips64elsf-k5.0" ;;
         mips64*)         echo "mips64sf-k5.0" ;;
@@ -49,29 +104,30 @@ detect_arch() {
         armv7*)          echo "armv7sf-k3.2" ;;
         armv5*)          echo "armv5sf-k3.2" ;;
         x64*|x86_64*)    echo "x64-k3.2" ;;
-        *)               echo "Ошибка: неизвестный таргет Entware: $arch" >&2; exit 1 ;;
+        *)               echo "Ошибка: неизвестный таргет Entware: $RAW_ARCH" >&2; exit 1 ;;
     esac
 }
 
 TARGET=$(detect_arch)
 
-# opkg знает таргет Entware, но не знает, какие ELF умеет ядро. На 64-битных
-# SoC с 32-битным userspace (MT7622 в KeeneticOS) opkg печатает aarch64, а
-# ядро отвечает armv7l и отказывает в exec aarch64-ELF: ENOEXEC, и busybox
-# начинает читать бинарник как sh-скрипт. Для ARM-семейства вердикт ядра
-# важнее — он и решает, запустится файл или нет.
+# Пакетный менеджер знает таргет сборки, но не знает, какие ELF умеет ядро.
+# На 64-битных SoC с 32-битным userspace (MT7622 в KeeneticOS) opkg печатает
+# aarch64, а ядро отвечает armv7l и отказывает в exec aarch64-ELF: ENOEXEC,
+# и busybox начинает читать бинарник как sh-скрипт. Для ARM-семейства вердикт
+# ядра важнее — он и решает, запустится файл или нет.
 kernel_m=$(uname -m 2>/dev/null)
 case "$kernel_m" in
     armv7l|armv8l|armv6l)
-        if [ "$TARGET" = "aarch64-k3.10" ]; then
-            echo "Ядро 32-битное ($kernel_m) — беру armv7 вместо $TARGET"
-            TARGET="armv7sf-k3.2"
-        fi ;;
+        case "$TARGET" in
+            aarch64*)
+                echo "Ядро 32-битное ($kernel_m) — беру armv7 вместо $TARGET"
+                TARGET="armv7sf-k3.2" ;;
+        esac ;;
 esac
 
-echo "Таргет: $TARGET (Entware arch: $(opkg print-architecture 2>/dev/null | awk '!/all|noarch/ {print $2; exit}'), ядро: ${kernel_m:-неизвестно})"
+echo "Таргет: $TARGET (arch: $RAW_ARCH, ядро: ${kernel_m:-неизвестно})"
 
-# 5. Скачиваем бинарник из последней версии GitHub Releases
+# 6. Скачиваем бинарник.
 # /tmp на роутерах — это tmpfs (RAM), поэтому скачиваем сразу в BIN_DIR,
 # иначе на моделях с 32-64 МБ RAM скачивание вызывает OOM-kill.
 mkdir -p "$BIN_DIR"
@@ -90,18 +146,8 @@ case "$TARGET" in
     *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
 
-# 6. Скачиваем или копируем бинарник.
-#
 # Бинарники лежат в ветке raw-bins и отдаются напрямую через
 # raw.githubusercontent.com — без редиректов на objects.githubusercontent.com.
-# curl -fsSL идёт сразу к файлу, без перенаправлений.
-fetch() { # $1 = url, $2 = output file
-    if [ -n "$GITHUB_TOKEN" ]; then
-        curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -o "$2" "$1"
-    else
-        curl -fsSL -o "$2" "$1"
-    fi
-}
 
 # Проверка ELF: неверно определённый таргет приводит к "syntax error:
 # unexpected (": ядро отказывает в exec (ENOEXEC), а busybox sh читает
@@ -150,13 +196,14 @@ else
 
     # SHA256SUMS — эталонный хеш. Совпадение доказывает целость лучше любого
     # разбора заголовка, поэтому при hash_ok разбор ELF пропускаем.
+    # Файл <1 КБ, его место в /tmp — на OpenWRT каталога /opt/tmp просто нет.
     hash_ok=""
     if command -v sha256sum >/dev/null 2>&1; then
-        fetch "$raw_base/SHA256SUMS" /opt/tmp/doq-web.sums \
+        fetch "$raw_base/SHA256SUMS" /tmp/doq-web.sums \
             || { rm -f "$TMP"; echo "Ошибка: SHA256SUMS download failed"; exit 1; }
-        want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' /opt/tmp/doq-web.sums)
+        want_hash=$(awk -v f="$BINARY" '$2==f{print $1}' /tmp/doq-web.sums)
         got_hash=$(sha256sum "$TMP" | awk '{print $1}')
-        rm -f /opt/tmp/doq-web.sums
+        rm -f /tmp/doq-web.sums
         if [ -z "$want_hash" ]; then
             rm -f "$TMP"
             echo "Ошибка: $BINARY не найден в SHA256SUMS."
@@ -187,7 +234,7 @@ if [ -z "$hash_ok" ]; then
     if [ -n "$got" ] && [ "$got" != "$want" ]; then
         rm -f "$TMP"
         echo "Ошибка: порядок байт бинарника ($got) не совпадает с таргетом $TARGET (ожидался $want)."
-        echo "Проверьте вывод: opkg print-architecture"
+        echo "Проверьте вывод: opkg print-architecture (Keenetic) или cat /etc/openwrt_release (OpenWRT)"
         exit 1
     fi
     echo "ELF OK (endianness ${got:-не проверен})"
@@ -206,9 +253,9 @@ else
     echo "Ошибка: бинарник не запускается (код $?): ${ver_out:-нет вывода}"
     echo "  размер: $(wc -c < "$TMP" 2>/dev/null) байт, магия: $(elf_magic "$TMP")"
     echo "  права: $(ls -l "$TMP" 2>/dev/null)"
-    echo "  монтирование /opt: $(mount 2>/dev/null | grep ' /opt ' || echo 'не найдено')"
-    echo "Если в строке монтирования есть noexec — /opt нельзя исполнять,"
-    echo "скопируйте бинарник в другую partition или перемонтируйте /opt."
+    echo "  монтирование $BIN_DIR: $(mount 2>/dev/null | grep -F "$BIN_DIR" || echo 'не найдено')"
+    echo "Если в строке монтирования есть noexec — раздел нельзя исполнять,"
+    echo "скопируйте бинарник в другую partition или перемонтируйте её."
     rm -f "$TMP"
     exit 1
 fi
@@ -218,9 +265,41 @@ mv "$TMP" "$BIN_DIR/$NAME"
 sync
 echo "Установлен бинарник: $BIN_DIR/$NAME"
 
-# 10. Создаем службу автозапуска для Entware (rc.unslung)
+# 10. Служба автозапуска.
+# OpenWRT: procd-скрипт — respawn сам поднимет демона после сбоя, а
+# enable создаст ссылки rc.d. Keenetic: rc.func из Entware (rc.unslung).
 mkdir -p "$INIT_DIR"
-cat > "$INIT_DIR/S57doq-web" << 'EOF'
+if [ "$PLATFORM" = "openwrt" ]; then
+    cat > "$SVC" << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=57
+STOP=10
+USE_PROCD=1
+PROG=/usr/sbin/doq-web
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "$PROG"
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+EOF
+    chmod +x "$SVC"
+    "$SVC" enable
+    echo "Служба procd создана и включена: $SVC"
+
+    # doq-web должен переживать sysupgrade с сохранением настроек —
+    # так же делает установщик апстрима для doqd (/lib/upgrade/keep.d/doqd).
+    if [ -f /etc/sysupgrade.conf ] && ! grep -qs "/doq-web" /etc/sysupgrade.conf; then
+        echo "$BIN_DIR/$NAME" >> /etc/sysupgrade.conf
+        echo "$SVC" >> /etc/sysupgrade.conf
+        echo "Добавлено в /etc/sysupgrade.conf (переживёт обновление прошивки)"
+    fi
+else
+    cat > "$SVC" << 'EOF'
 #!/bin/sh
 
 ENABLED=yes
@@ -233,24 +312,25 @@ PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 . /opt/etc/init.d/rc.func
 EOF
 
-chmod +x "$INIT_DIR/S57doq-web"
+    chmod +x "$SVC"
 
-# 11. Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
-# На современных KeeneticOS /flash — read-only, и это не проблема: ndm при
-# монтировании раздела с /opt сам запускает скрипты /opt/etc/init.d/S*,
-# а S57doq-web создан на шаге 10. Неудачная запись не должна ронять
-# установку — на set -e перенаправление >> убило бы скрипт до запуска сервиса.
-RC_LINE='if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi'
-if grep -qs "S57doq-web" /flash/rc.custom 2>/dev/null; then
-    echo "Автозапуск в /flash/rc.custom уже существует"
-elif echo "$RC_LINE" >> /flash/rc.custom 2>/dev/null; then
-    chmod +x /flash/rc.custom
-    echo "Добавлен автозапуск в /flash/rc.custom"
-else
-    echo "rc.custom недоступен (read-only) — автозапуск через /opt/etc/init.d/S57doq-web"
+    # Попытка добавить автозапуск в rc.custom (есть не на всех прошивках).
+    # На современных KeeneticOS /flash — read-only, и это не проблема: ndm при
+    # монтировании раздела с /opt сам запускает скрипты /opt/etc/init.d/S*,
+    # а S57doq-web создан выше. Неудачная запись не должна ронять
+    # установку — на set -e перенаправление >> убило бы скрипт до запуска сервиса.
+    RC_LINE='if [ -x /opt/etc/init.d/S57doq-web ]; then /opt/etc/init.d/S57doq-web start; fi'
+    if grep -qs "S57doq-web" /flash/rc.custom 2>/dev/null; then
+        echo "Автозапуск в /flash/rc.custom уже существует"
+    elif echo "$RC_LINE" >> /flash/rc.custom 2>/dev/null; then
+        chmod +x /flash/rc.custom
+        echo "Добавлен автозапуск в /flash/rc.custom"
+    else
+        echo "rc.custom недоступен (read-only) — автозапуск через $SVC"
+    fi
 fi
 
-# 12. Перезапускаем сервис.
+# 11. Перезапускаем сервис.
 #
 # При обновлении старый doq-web уже запущен и держит порт 8091. Если просто
 # вызвать start, rc.func увидит живой PID из pid-файла, решит "уже работает" и
@@ -258,7 +338,7 @@ fi
 # останется старая версия. Поэтому сначала stop.
 if pidof "$NAME" >/dev/null 2>&1; then
     echo "Останавливаю запущенную версию..."
-    "$INIT_DIR/S57doq-web" stop || true
+    "$SVC" stop || true
     sleep 1
 fi
 
@@ -268,7 +348,7 @@ if netstat -tln 2>/dev/null | grep -q ':8091 '; then
 fi
 
 echo "Запускаю службу..."
-"$INIT_DIR/S57doq-web" start || true
+"$SVC" start || true
 sleep 2
 
 # Проверка PID и диагностика при неудаче
@@ -282,7 +362,7 @@ else
     FPID=$!
     sleep 5
     if kill -0 "$FPID" 2>/dev/null; then
-        echo "В foreground процесс жив — проблема в rc.func/ENVIRONMENT."
+        echo "В foreground процесс жив — проблема в init-скрипте/ENVIRONMENT."
         kill "$FPID" 2>/dev/null
     else
         wait "$FPID" 2>/dev/null
@@ -291,9 +371,10 @@ else
     exit 1
 fi
 
-# 13. Определяем локальный IP-адрес роутера
+# 12. Определяем локальный IP-адрес роутера (Keenetic: br0/br1, OpenWRT: br-lan)
 IP=$(ip -4 addr show br0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP=$(ip -4 addr show br1 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
+[ -z "$IP" ] && IP=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1)
 [ -z "$IP" ] && IP="<IP-роутера>"
 
 echo ""

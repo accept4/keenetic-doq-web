@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// pageHTML содержит 7 плейсхолдеров %[1]s … %[7]d. page() передаёт ровно 7
-// аргументов: dot, title, label, msgHTML, status, list, age.
+// pageHTML содержит 8 плейсхолдеров %[1]s … %[8]s. page() передаёт ровно 8
+// аргументов: dot, title, label, msgHTML, status, list, age, customHostsPath.
 func TestRenderPageHTML(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -20,8 +20,13 @@ func TestRenderPageHTML(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "</html>") {
+	body := rec.Body.String()
+	if !strings.Contains(body, "</html>") {
 		t.Errorf("output does not end with </html>")
+	}
+	// Непрорендеренный плейсхолдер = page() разучилась подставлять аргументы.
+	if strings.Contains(body, "%[") {
+		t.Errorf("unrendered format placeholder in page output")
 	}
 }
 
@@ -423,5 +428,24 @@ func TestPageHasNoGeoUI(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("page missing hosts UI %q", want)
 		}
+	}
+}
+
+// applyPlatform переключает все пути doqd между Keenetic (Entware, /opt) и
+// OpenWRT (/etc, /usr/sbin, procd). Тест восстанавливает состояние после себя.
+func TestApplyPlatform(t *testing.T) {
+	defer applyPlatform(false)
+
+	applyPlatform(false)
+	if doqdConfPath != "/opt/etc/doqd.conf" || doqdInitScript != "/opt/etc/init.d/S56doqd" ||
+		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh") {
+		t.Errorf("keenetic paths wrong: %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller)
+	}
+
+	applyPlatform(true)
+	if doqdConfPath != "/etc/doqd.conf" || doqdInitScript != "/etc/init.d/doqd" ||
+		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install-openwrt.sh") ||
+		customHostsPath != "/etc/doqd/hosts" {
+		t.Errorf("openwrt paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, customHostsPath)
 	}
 }
