@@ -1,57 +1,62 @@
-$env:CGO_ENABLED = "0"
+﻿$env:CGO_ENABLED = "0"
 $env:GOFLAGS = "-trimpath"
+
+# Версия панели подшивается в main.webVersion — её отдаёт `doq-web -version`,
+# которым install.sh проверяет, что бинарник запускается на данной архитектуре.
+$VER = "v1.1.0"
+$LDF = "-ldflags=-s -w -X main.webVersion=$VER"
 
 # linux/arm64 (Keenetic Giga KN-1010, Ultra KN-1811 — aarch64)
 $env:GOOS = "linux"; $env:GOARCH = "arm64"
-go build -ldflags="-s -w" -o dist/doq-web-linux-arm64 .
+go build $LDF -o dist/doq-web-linux-arm64 .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL arm64"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-arm64"
 
 # linux/arm GOARM=7 (Keenetic old models — armv7sf-k3.2)
 $env:GOARCH = "arm"; $env:GOARM = "7"
-go build -ldflags="-s -w" -o dist/doq-web-linux-arm .
+go build $LDF -o dist/doq-web-linux-arm .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL arm"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-arm"
 
 # linux/mipsle softfloat (Keenetic Ultra KN-1810, Hero KN-1011 — mipselsf-k3.4)
 $env:GOARCH = "mipsle"; $env:GOMIPS = "softfloat"
-go build -ldflags="-s -w" -o dist/doq-web-linux-mipsle .
+go build $LDF -o dist/doq-web-linux-mipsle .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mipsle"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mipsle"
 
 # linux/mips softfloat big-endian (Entware mipssf-k3.4)
 $env:GOARCH = "mips"; $env:GOMIPS = "softfloat"
-go build -ldflags="-s -w" -o dist/doq-web-linux-mips .
+go build $LDF -o dist/doq-web-linux-mips .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mips"
 
 # linux/mips64le softfloat (OpenWRT mips64el, Entware mips64r6el)
 $env:GOARCH = "mips64le"; $env:GOMIPS = "softfloat"
-go build -ldflags="-s -w" -o dist/doq-web-linux-mips64le .
+go build $LDF -o dist/doq-web-linux-mips64le .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips64le"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mips64le"
 
 # linux/mips64 softfloat big-endian (OpenWRT mips64)
 $env:GOARCH = "mips64"; $env:GOMIPS = "softfloat"
-go build -ldflags="-s -w" -o dist/doq-web-linux-mips64 .
+go build $LDF -o dist/doq-web-linux-mips64 .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL mips64"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-mips64"
 
 # linux/amd64 (Entware x64-k3.2, отладка на ПК)
 $env:GOOS = "linux"; $env:GOARCH = "amd64"; $env:GOMIPS = ""
-go build -ldflags="-s -w" -o dist/doq-web-linux-amd64 .
+go build $LDF -o dist/doq-web-linux-amd64 .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL amd64"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-amd64"
 
 # linux/arm GOARM=5 (Entware armv5sf-k3.2)
 $env:GOARCH = "arm"; $env:GOARM = "5"
-go build -ldflags="-s -w" -o dist/doq-web-linux-armv5 .
+go build $LDF -o dist/doq-web-linux-armv5 .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL armv5"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-armv5"
 
 # windows/amd64
 $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:GOMIPS = ""; $env:GOARM = ""
-go build -ldflags="-s -w" -o dist/doq-web-windows-amd64.exe .
+go build $LDF -o dist/doq-web-windows-amd64.exe .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL win"; exit 1 }
 Write-Host "OK  dist/doq-web-windows-amd64.exe"
 

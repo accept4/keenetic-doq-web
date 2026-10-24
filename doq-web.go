@@ -38,13 +38,12 @@ const (
 	refreshAfterRestart = 4 * time.Second
 )
 
-// doqd не печатает свою версию (команды `doqd version` в апстриме нет),
-// поэтому версия берётся так:
+// Версия doqd:
+//   - установленная — из `doqd -version` (флаг появился в SmartDNS-сборках);
+//     файл version.txt, который панель писала после install/update, остался
+//     как запасной вариант для старых бинарников без флага;
 //   - последняя версия апстрима — из GitHub API (кэшируется, лимит
-//     анонимных запросов 60/ч с одного IP);
-//   - установленная версия — из файла version.txt, который веб-панель
-//     пишет после успешного install/update. До первого обновления через
-//     панель файл пуст, и UI показывает только последнюю версию.
+//     анонимных запросов 60/ч с одного IP).
 const (
 	upstreamRepo    = "necronicle/keenetic-doq"
 	versionFile     = "/opt/etc/doq-web/version.txt"
@@ -96,14 +95,40 @@ func latestUpstream() string {
 	return latestVer
 }
 
-// installedDoqdVersion — версия, записанная после последней установки через
-// панель. Пустая строка, если файл ещё не создан.
+// installedDoqdVersion — версия doqd: сначала `doqd -version` (кэш 6 ч,
+// форкать демона на каждый хит страницы незачем), при неудаче — version.txt
+// от прошлых установок панели.
 func installedDoqdVersion() string {
+	if v := doqdVersion(); v != "" {
+		return v
+	}
 	b, err := os.ReadFile(versionFile)
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+var (
+	doqdVerMu      sync.Mutex
+	doqdVer        string
+	doqdVerFetched time.Time
+)
+
+// doqdVersion парсит вывод `doqd -version` ("doqd 0.6.1"). run() на ошибке
+// возвращает строку "Ошибка: ...", она не матчится и трактуется как пусто.
+func doqdVersion() string {
+	doqdVerMu.Lock()
+	defer doqdVerMu.Unlock()
+	if doqdVer != "" && time.Since(doqdVerFetched) < latestRefreshIt {
+		return doqdVer
+	}
+	out := run("doqd", "-version")
+	if v := strings.TrimSpace(strings.TrimPrefix(out, "doqd ")); v != out && v != "" {
+		doqdVer, doqdVerFetched = v, time.Now()
+		return doqdVer
+	}
+	return doqdVer
 }
 
 // saveInstalledDoqdVersion пишет установленную версию в version.txt.
@@ -283,11 +308,13 @@ func main() {
 	http.HandleFunc("/start", onlyPOST(start))
 	http.HandleFunc("/install", onlyPOST(install))
 	http.HandleFunc("/update", onlyPOST(update))
-	http.HandleFunc("/geo", onlyPOST(geo))
-	http.HandleFunc("/geo-reselect", onlyPOST(geoReselect))
-	http.HandleFunc("/add-domain", onlyPOST(addDomain))
-	http.HandleFunc("/remove-domain", onlyPOST(removeDomain))
-	http.HandleFunc("/domains", domainsJSON)
+	// Hosts (подмена адресов) — замена geo-domain из doqd <=0.5.x.
+	http.HandleFunc("/hosts", hostsStatusJSON)
+	http.HandleFunc("/hosts/check", onlyPOST(hostsCheck))
+	http.HandleFunc("/hosts/reload", onlyPOST(hostsReload))
+	http.HandleFunc("/hosts/save", onlyPOST(hostsSave))
+	http.HandleFunc("/hosts/enable", onlyPOST(hostsEnableCustom))
+	http.HandleFunc("/hosts/disable", onlyPOST(hostsDisableCustom))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -346,8 +373,8 @@ func page(w http.ResponseWriter, r *http.Request) {
 // addFlags — белый список флагов doqd add. Без него через подменённую
 // форму в exec можно было передать что угодно: exec.CommandContext не
 // знает про шелл, но произвольные аргументы doqd всё равно принимает.
+// --geo удалён из doqd вместе с гео-DNS (SmartDNS-переработка).
 var addFlags = map[string]bool{
-	"--geo":      true,
 	"--fallback": true,
 	"--force":    true,
 }
@@ -399,108 +426,182 @@ func test(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode(out), 303)
 }
 
-// validDomain проверяет, что s — одиночный домен без схемы, пробелов и
-// спецсимволов (то, что принимает doqd add-domain). Флаги вида "--geo"
-// и инъекции аргументов сюда не проходят.
-var domainRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$`)
+// ---------- Hosts (подмена адресов) ----------
+//
+// doqd 0.6.x (SmartDNS) удалил geo/geo-domain: вместо них директива
+// `hosts builtin` или `hosts /полный/путь/к/файлу` в конфиге. Файл
+// полностью заменяет встроенный снимок; SIGHUP (doqd hosts reload)
+// перечитывает его атомарно, ошибочный файл не применяется.
 
-func addDomain(w http.ResponseWriter, r *http.Request) {
-	domain := strings.TrimSpace(r.FormValue("domain"))
-	if !domainRe.MatchString(domain) {
-		http.Redirect(w, r, "/?msg="+encode("Ошибка: некорректное имя домена"), 303)
-		return
+// doqdConfPath — конфиг doqd на Keenetic. Переменная, а не константа:
+// тесты подменяют её на временный файл.
+var doqdConfPath = "/opt/etc/doqd.conf"
+
+// customHostsPath — куда экспортим встроенный снимок при создании своего файла.
+const customHostsPath = "/opt/etc/doqd.hosts"
+
+// hostsEditMax — потолок размера hosts-файла в редакторе. Встроенный снимок
+// ~1025 имён (< 100 КБ); 256 КБ с запасом, и protects RAM/flash на роутере.
+const hostsEditMax = 256 << 10
+
+// hostsMode читает директиву hosts из конфига: ("builtin","") если встроенный
+// список (или директивы нет — doqd по умолчанию использует builtin), либо
+// ("file", путь) для своего файла.
+func hostsMode() (string, string) {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return "builtin", ""
 	}
-	out := run("doqd", "add-domain", domain)
-	requestRefreshAfter(refreshAfterRestart)
-	http.Redirect(w, r, "/?msg="+encode(out), 303)
-}
-
-func removeDomain(w http.ResponseWriter, r *http.Request) {
-	domain := strings.TrimSpace(r.FormValue("domain"))
-	if !domainRe.MatchString(domain) {
-		http.Redirect(w, r, "/?msg="+encode("Ошибка: некорректное имя домена"), 303)
-		return
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "hosts" {
+			if f[1] == "builtin" {
+				return "builtin", ""
+			}
+			return "file", f[1]
+		}
 	}
-	out := run("doqd", "remove-domain", domain)
-	requestRefreshAfter(refreshAfterRestart)
-	http.Redirect(w, r, "/?msg="+encode(out), 303)
+	return "builtin", ""
 }
 
-// builtinGeoDomains — встроенный список геоблокированных доменов doqd.
-// doqd remove-domain не позволяет удалить встроенный, но веб-панель должна
-// показать, что домен встроен (чтобы не удалять зря). Список берётся из
-// internal/geo/builtin.go апстрима: https://github.com/necronicle/keenetic-doq
-var builtinGeoDomains = []string{
-	"chatgpt.com", "openai.com", "claude.ai", "anthropic.com",
-	"gemini.google.com", "bard.google.com", "deepmind.com",
-	"poe.com", "perplexity.ai", "midjourney.com",
-	"discord.com", "discord.gg", "tiktok.com",
-	"t.me", "telegram.org", "whatsapp.com", "messenger.com",
-	"twitter.com", "x.com", "instagram.com", "facebook.com",
-	"tiktokcdn.com", "tiktokv.com", "snap.com", "snapchat.com",
-	"netflix.com", "discomax.com", "hulu.com", "spotify.com",
-	"twitch.tv", "twitchcdn.net", "youtube.com", "ytimg.com",
-	"googlevideo.com", "ggpht.com",
+// setHostsDirective заменяет строку hosts в doqd.conf. Оригинал сохраняется в
+// .bak — миграцию гео-настроек апстрим делает свою копию, но здесь правка
+// идёт из UI, и откат должен быть возможен без reinstall.
+func setHostsDirective(value string) error {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	replaced := false
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "#") {
+			continue
+		}
+		if f := strings.Fields(t); len(f) >= 1 && f[0] == "hosts" {
+			lines[i] = "hosts " + value
+			replaced = true
+		}
+	}
+	if !replaced {
+		// Конфиг без директивы: дописываем в конец. В Default() doqd
+		// использует builtin, явная строка делает состояние видимым.
+		lines = append(lines, "hosts "+value)
+	}
+	if err := os.WriteFile(doqdConfPath+".bak", b, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(doqdConfPath, []byte(strings.Join(lines, "\n")), 0o644)
 }
 
-// domainsJSON — API: /domains -> [{"domain":"chatgpt.com","builtin":true}, ...]
-func domainsJSON(w http.ResponseWriter, r *http.Request) {
+// hostsStatusJSON — GET /hosts: режим, путь, вывод `doqd hosts status` и
+// содержимое файла для редактора (в file-режиме).
+func hostsStatusJSON(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET only", 405)
 		return
 	}
+	mode, path := hostsMode()
+	resp := map[string]any{
+		"mode":   mode,
+		"path":   path,
+		"status": runWithTimeout("doqd", 10*time.Second, "hosts", "status"),
+	}
+	if mode == "file" && path != "" {
+		if b, err := os.ReadFile(path); err == nil {
+			if len(b) > hostsEditMax {
+				resp["content"] = string(b[:hostsEditMax]) + "\n... (обрезано)"
+			} else {
+				resp["content"] = string(b)
+			}
+		} else {
+			resp["error"] = "не удалось прочитать " + path + ": " + err.Error()
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
 
-	// Читаем конфиг и извлекаем geo-domain строки
-	b, err := os.ReadFile("/opt/etc/doqd.conf")
-	if err != nil {
-		http.Error(w, "conf not found", 500)
+func hostsCheck(w http.ResponseWriter, r *http.Request) {
+	out := runWithTimeout("doqd", 15*time.Second, "hosts", "check")
+	http.Redirect(w, r, "/?msg="+encode("hosts check:\n"+out), 303)
+}
+
+func hostsReload(w http.ResponseWriter, r *http.Request) {
+	out := run("doqd", "hosts", "reload")
+	http.Redirect(w, r, "/?msg="+encode("hosts reload:\n"+out), 303)
+}
+
+// hostsSave пишет редактор в файл из директивы hosts, проверяет его и только
+// при успешной проверке даёт демону SIGHUP. Путь берётся строго из конфига —
+// форма не может записать произвольный файл.
+func hostsSave(w http.ResponseWriter, r *http.Request) {
+	content := r.FormValue("content")
+	if len(content) > hostsEditMax {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: файл слишком большой (>256 КБ)"), 303)
 		return
 	}
-
-	builtinSet := make(map[string]bool, len(builtinGeoDomains))
-	for _, d := range builtinGeoDomains {
-		builtinSet[d] = true
+	mode, path := hostsMode()
+	if mode != "file" || path == "" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: сейчас используется встроенный список — сначала создайте свой файл"), 303)
+		return
 	}
-
-	// Парсим строки вида "geo-domain example.com"
-	var domains []struct {
-		Domain  string `json:"domain"`
-		Builtin bool   `json:"builtin"`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка записи "+path+": "+err.Error()), 303)
+		return
 	}
-
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(strings.ToLower(line))
-		if !strings.HasPrefix(line, "geo-domain ") {
-			continue
-		}
-		domain := strings.TrimSpace(strings.TrimPrefix(line, "geo-domain "))
-		if domain == "" || strings.HasPrefix(domain, "#") {
-			continue
-		}
-		domains = append(domains, struct {
-			Domain  string `json:"domain"`
-			Builtin bool   `json:"builtin"`
-		}{Domain: domain, Builtin: builtinSet[domain]})
+	// Ошибочный файл не должен уходить в демона: reload только после check.
+	out := runWithTimeout("doqd", 15*time.Second, "hosts", "check")
+	if strings.HasPrefix(out, "Ошибка:") {
+		http.Redirect(w, r, "/?msg="+encode("Сохранено, но hosts check не прошёл — демон оставил старые правила:\n"+out), 303)
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(domains)
+	reload := run("doqd", "hosts", "reload")
+	http.Redirect(w, r, "/?msg="+encode("Hosts сохранены и применены:\n"+out+"\n"+reload), 303)
 }
 
-func geo(w http.ResponseWriter, r *http.Request) {
-	out := run("doqd", "geo")
-	http.Redirect(w, r, "/?msg="+encode("doqd geo:\n"+out), 303)
-}
-
-// geoReselect переоценивает серверы обхода. По README апстрима команда
-// ждёт до 45 с, поэтому и таймаут процесса, и дедлайн записи ответа
-// подняты выше дефолтных 3 с и 20 с — иначе context убивал doqd на
-// середине переоценки ("signal: killed").
-func geoReselect(w http.ResponseWriter, r *http.Request) {
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(70 * time.Second))
-	out := runWithTimeout("doqd", 60*time.Second, "geo", "reselect")
+// hostsEnableCustom экспортирует встроенный снимок в customHostsPath и
+// переключает конфиг на него. Смена директивы hosts требует рестарта:
+// SIGHUP перечитывает файл, но сам источник фиксируется при старте.
+func hostsEnableCustom(w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(90 * time.Second))
+	if runtime.GOOS == "windows" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: недоступно на ПК"), 303)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// Пути константы — шелл здесь только для редиректа вывода.
+	out, err := exec.CommandContext(ctx, "sh", "-c",
+		"doqd hosts export > "+customHostsPath+".tmp && [ -s "+customHostsPath+".tmp ] && mv "+customHostsPath+".tmp "+customHostsPath).CombinedOutput()
+	if err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка экспорта: "+stripANSI(string(out))+"\n"+err.Error()), 303)
+		return
+	}
+	if err := setHostsDirective(customHostsPath); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
 	requestRefreshAfter(refreshAfterRestart)
-	http.Redirect(w, r, "/?msg="+encode("geo reselect:\n"+out), 303)
+	http.Redirect(w, r, "/?msg="+encode("Свой hosts включён ("+customHostsPath+"), демон перезапущен:\n"+restartOut), 303)
+}
+
+// hostsDisableCustom возвращает конфиг на встроенный снимок.
+func hostsDisableCustom(w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(90 * time.Second))
+	if err := setHostsDirective("builtin"); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run("/opt/etc/init.d/S56doqd", "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Включён встроенный hosts, демон перезапущен:\n"+restartOut), 303)
 }
 
 func restart(w http.ResponseWriter, r *http.Request) {
@@ -992,8 +1093,7 @@ const pageHTML = `
           <div class="form-row">
             <select name="type" style="flex:1;min-width:220px;padding:10px 14px;background:#0d1117;border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;">
               <option value="">upstream</option>
-              <option value="--geo">geo</option>
-              <option value="--fallback">fallback</option>
+              <option value="--fallback">fallback (резервный)</option>
               <option value="--force">force (пропустить проверку)</option>
             </select>
             <button class="btn btn-primary" type="submit">Add</button>
@@ -1029,81 +1129,94 @@ const pageHTML = `
     </div>
   </div>
 
-  <div class="grid-2">
-    <div class="card">
-      <div class="card-header">Геоблокированный домен</div>
-      <div class="card-body">
-        <form method="POST" action="/add-domain">
-          <label>Домен (и поддомены)</label>
-          <div class="form-row">
-            <input type="text" name="domain" placeholder="example.com" required>
-            <button class="btn btn-primary" type="submit">Add</button>
-          </div>
-        </form>
-        <form method="POST" action="/remove-domain" style="margin-top:12px;">
-          <label>Удалить домен</label>
-          <div class="form-row">
-            <select name="domain" id="domainSelect" required>
-              <option value="">— Выберите домен —</option>
-            </select>
-            <button class="btn btn-red" type="submit">Remove</button>
-          </div>
-        </form>
-        <div id="domainList" style="margin-top:12px;"></div>
-      </div>
+  <!-- Hosts (подмена адресов) -->
+  <div class="card">
+    <div class="card-header">
+      <span>Hosts — подмена адресов</span>
+      <span style="font-size:11px;color:var(--text2)" id="hostsMode"></span>
     </div>
-
-    <div class="card">
-      <div class="card-header">Geo-серверы</div>
-      <div class="card-body">
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px;">
-          Закреплённый сервер обхода, рейтинг прокси, живость TLS.
-        </p>
-        <div class="form-row" style="flex-wrap:wrap;">
-          <form method="POST" action="/geo" style="display:inline;margin-right:8px;">
-            <button class="btn btn-primary" type="submit">📊 Geo</button>
-          </form>
-          <form method="POST" action="/geo-reselect" style="display:inline;">
-            <button class="btn btn-blue" type="submit">🔄 Reselect</button>
-          </form>
-        </div>
-        <p style="font-size:11px;color:var(--text2);margin-top:8px;">
-          Reselect — переоценить серверы обхода сейчас (до 45 с)
-        </p>
+    <div class="card-body">
+      <pre id="hostspre">загрузка…</pre>
+      <div class="form-row" style="margin-top:12px;flex-wrap:wrap;">
+        <form method="POST" action="/hosts/check" style="display:inline;margin-right:8px;">
+          <button class="btn btn-primary" type="submit">✔ Check</button>
+        </form>
+        <form method="POST" action="/hosts/reload" style="display:inline;margin-right:8px;">
+          <button class="btn btn-blue" type="submit">⟳ Reload</button>
+        </form>
+        <form method="POST" action="/hosts/enable" style="display:inline;margin-right:8px;" id="hostsEnableForm">
+          <button class="btn btn-green" type="submit">⇩ Создать свой файл из встроенного</button>
+        </form>
+        <form method="POST" action="/hosts/disable" style="display:inline;" id="hostsDisableForm">
+          <button class="btn btn-orange" type="submit">↩ Встроенный список</button>
+        </form>
       </div>
+      <div id="hostsEditor" style="display:none;margin-top:14px;">
+        <form method="POST" action="/hosts/save">
+          <label>Файл <span id="hostsPath"></span> (полностью заменяет встроенный снимок)</label>
+          <textarea name="content" id="hostsContent" spellcheck="false" style="width:100%%;height:240px;background:#0d1117;border:1px solid var(--border);border-radius:8px;color:#c9d1d9;font-size:12px;line-height:1.5;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical;"></textarea>
+          <div class="form-row" style="margin-top:10px;">
+            <button class="btn btn-primary" type="submit">💾 Сохранить и применить</button>
+          </div>
+        </form>
+      </div>
+      <p style="font-size:11px;color:var(--text2);margin-top:10px;">
+        Формат: <code>IP домен1 домен2 …</code> — точные имена, комментарии через #.
+        Reload — SIGHUP, перечитывает файл атомарно; ошибочный файл демон не применяет.
+      </p>
     </div>
   </div>
 </main>
 
 <script>
 (function () {
-  // Список геоблокированных доменов: загрузка из /domains, отображение
-  // в виде чипов и заполнение выпадающего списка для удаления.
-  var domainList = document.getElementById('domainList');
-  var domainSelect = document.getElementById('domainSelect');
-  function loadDomains() {
-    fetch('/domains').then(function(r) { return r.json(); }).then(function(list) {
-      if (!domainSelect) return;
-      var prev = domainSelect.value;
-      domainSelect.innerHTML = '<option value="">— Выберите домен —</option>';
-      var chips = '';
-      for (var i = 0; i < list.length; i++) {
-        var d = list[i];
-        var opt = document.createElement('option');
-        opt.value = d.domain;
-        opt.textContent = d.domain + (d.builtin ? ' (встроенный)' : '');
-        if (!d.builtin) domainSelect.appendChild(opt);
-        var cls = d.builtin ? 'opacity:.5' : '';
-        chips += '<span style="display:inline-block;padding:2px 8px;margin:2px;border-radius:4px;font-size:11px;background:' + (d.builtin ? '#374151' : '#1e3a5f') + ';color:#e5e7eb;' + cls + '">' + d.domain + (d.builtin ? ' <small>🔒</small>' : '') + '</span>';
+  // Hosts-карточка: режим, статус, редактор файла. Данные с /hosts (JSON).
+  var pre = document.getElementById('hostspre');
+  var modeEl = document.getElementById('hostsMode');
+  var editor = document.getElementById('hostsEditor');
+  var content = document.getElementById('hostsContent');
+  var pathEl = document.getElementById('hostsPath');
+  var enableF = document.getElementById('hostsEnableForm');
+  var disableF = document.getElementById('hostsDisableForm');
+  function loadHosts() {
+    fetch('/hosts', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error('http'); }
+      return r.json();
+    }).then(function (d) {
+      if (modeEl) {
+        modeEl.textContent = d.mode === 'file' ? 'свой файл: ' + d.path : 'встроенный снимок';
       }
-      if (chips) domainList.innerHTML = '<div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">В конфиге (' + list.length + '):</div><div>' + chips + '</div>';
-      else domainList.innerHTML = '<div style="font-size:11px;color:#9ca3af;">Список пуст</div>';
-      if (prev) domainSelect.value = prev;
-    }).catch(function() {
-      if (domainList) domainList.innerHTML = '<div style="font-size:11px;color:#ef4444;">Не удалось загрузить список</div>';
+      if (pre) { pre.textContent = d.status || 'нет данных'; }
+      if (d.mode === 'file') {
+        if (editor) { editor.style.display = ''; }
+        if (enableF) { enableF.style.display = 'none'; }
+        if (pathEl) { pathEl.textContent = d.path; }
+        if (content && typeof d.content === 'string') { content.value = d.content; }
+        if (d.error && pre) { pre.textContent += '\n' + d.error; }
+      } else {
+        if (editor) { editor.style.display = 'none'; }
+        if (disableF) { disableF.style.display = 'none'; }
+      }
+    }).catch(function () {
+      if (pre) { pre.textContent = 'Не удалось получить hosts-статус'; }
     });
   }
-  loadDomains();
+  loadHosts();
+  if (enableF) {
+    enableF.addEventListener('submit', function (e) {
+      if (!window.confirm('Экспортировать встроенный снимок в /opt/etc/doqd.hosts\nи переключить doqd на свой файл?\n\nДемон будет перезапущен.')) {
+        e.preventDefault();
+      }
+    });
+  }
+  if (disableF) {
+    disableF.addEventListener('submit', function (e) {
+      if (!window.confirm('Вернуться на встроенный снимок hosts?\n\nДемон будет перезапущен.')) {
+        e.preventDefault();
+      }
+    });
+  }
+})();
 </script>
 
 <script>

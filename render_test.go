@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -296,5 +297,131 @@ func TestControlOutputKeepsLinesAndListKeepsColumns(t *testing.T) {
 	table := "1  quic://a.example.com  ok\n2  quic://b.example.com  timeout"
 	if got := stripANSI(table); got != table {
 		t.Errorf("stripANSI исказил таблицу: %q", got)
+	}
+}
+
+// ---------- Hosts ----------
+
+// hostsMode понимает builtin, свой файл и отсутствующую директиву (doqd по
+// умолчанию использует builtin). Комментированная строка hosts не считается.
+func TestHostsMode(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+
+	write := func(s string) { doqdConfPath = dir + "/doqd.conf"; os.WriteFile(doqdConfPath, []byte(s), 0o644) }
+
+	write("listen 192.168.1.1:5354\nhosts builtin\nupstream quic://dns.quad9.net\n")
+	if m, p := hostsMode(); m != "builtin" || p != "" {
+		t.Errorf("builtin: got %q,%q want builtin,\"\"", m, p)
+	}
+
+	write("hosts /opt/etc/doqd.hosts\n")
+	if m, p := hostsMode(); m != "file" || p != "/opt/etc/doqd.hosts" {
+		t.Errorf("file: got %q,%q want file,/opt/etc/doqd.hosts", m, p)
+	}
+
+	write("listen 0.0.0.0:5354\n# hosts /tmp/x\n")
+	if m, p := hostsMode(); m != "builtin" || p != "" {
+		t.Errorf("missing/commented: got %q,%q want builtin,\"\"", m, p)
+	}
+
+	doqdConfPath = dir + "/nope.conf"
+	if m, _ := hostsMode(); m != "builtin" {
+		t.Errorf("no conf: got %q want builtin", m)
+	}
+}
+
+// setHostsDirective заменяет существующую строку, дописывает при отсутствии
+// и сохраняет .bak.
+func TestSetHostsDirective(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/doqd.conf"
+
+	os.WriteFile(doqdConfPath, []byte("hosts builtin\nupstream quic://a\n"), 0o644)
+	if err := setHostsDirective("/opt/etc/doqd.hosts"); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	b, _ := os.ReadFile(doqdConfPath)
+	if !strings.Contains(string(b), "hosts /opt/etc/doqd.hosts") || strings.Contains(string(b), "hosts builtin") {
+		t.Errorf("replace failed: %q", b)
+	}
+	if bak, err := os.ReadFile(doqdConfPath + ".bak"); err != nil || !strings.Contains(string(bak), "hosts builtin") {
+		t.Errorf("backup missing/wrong: %q %v", bak, err)
+	}
+
+	os.WriteFile(doqdConfPath, []byte("upstream quic://a\n"), 0o644)
+	if err := setHostsDirective("builtin"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	b, _ = os.ReadFile(doqdConfPath)
+	if !strings.Contains(string(b), "hosts builtin") {
+		t.Errorf("append failed: %q", b)
+	}
+}
+
+// hostsSave в builtin-режиме обязан отказать: запись возможна только в файл
+// из директивы hosts, иначе форма запишет произвольный путь.
+func TestHostsSaveRejectsBuiltinMode(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/doqd.conf"
+	os.WriteFile(doqdConfPath, []byte("hosts builtin\n"), 0o644)
+
+	form := url.Values{"content": []string{"5.175.161.3 example.com\n"}}
+	req := httptest.NewRequest(http.MethodPost, "/hosts/save", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	hostsSave(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "%D0%92%D1%81%D1%82%D1%80%D0%BE%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9") && !strings.Contains(loc, "msg") {
+		t.Errorf("expected redirect with error msg, got %q", loc)
+	}
+}
+
+// hostsStatusJSON отвечает JSON с mode/status даже без конфига (builtin).
+func TestHostsStatusJSON(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/nope.conf"
+
+	rec := httptest.NewRecorder()
+	hostsStatusJSON(rec, httptest.NewRequest(http.MethodGet, "/hosts", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, key := range []string{`"mode"`, `"status"`} {
+		if !strings.Contains(body, key) {
+			t.Errorf("JSON missing key %s: %s", key, body)
+		}
+	}
+	if !strings.Contains(body, `"builtin"`) {
+		t.Errorf("missing default mode builtin: %s", body)
+	}
+}
+
+// UI больше не должен содержать geo-команд, удалённых из doqd 0.6.x.
+func TestPageHasNoGeoUI(t *testing.T) {
+	rec := httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	for _, banned := range []string{"/geo", "add-domain", "remove-domain", "--geo", "Geo-серверы"} {
+		if strings.Contains(body, banned) {
+			t.Errorf("page still references removed command %q", banned)
+		}
+	}
+	for _, want := range []string{"/hosts/check", "/hosts/reload", "/hosts/save", "hostsEnableForm"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page missing hosts UI %q", want)
+		}
 	}
 }
