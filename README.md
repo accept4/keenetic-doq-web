@@ -1,6 +1,6 @@
 # keenetic-doq-web
 
-Веб-панель для управления **keenetic-doq** (DNS-over-QUIC форвардер) на роутерах Keenetic/OpenWRT с Entware.
+Веб-панель для управления **[keenetic-doq](https://github.com/necronicle/keenetic-doq)** (DNS-over-QUIC форвардер) на роутерах Keenetic/OpenWRT с Entware.
 
 Позволяет через браузер управлять DoQ-апстримами, файлом hosts (подмена адресов) и перезапускать сервис — без ручной правки конфигов и SSH.
 
