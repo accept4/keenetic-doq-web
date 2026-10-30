@@ -219,8 +219,7 @@ func requestRefreshAfter(d time.Duration) {
 	time.AfterFunc(d, requestRefresh)
 }
 
-// doRefresh — единственное место, где форкается doqd. Вызывается из одной
-// горутины, одновременные пары status+list исключены по построению.
+// doRefresh вызывается из одной горутины: фоновые status/list не перекрываются.
 func doRefresh() {
 	s := run("doqd", "status")
 	l := run("doqd", "list")
@@ -253,10 +252,50 @@ func commandAvailable(name string) error {
 	return err
 }
 
-// run — выполняет команду с таймаутом 3 секунды. Для долгих операций
+// commandTimeout учитывает сетевые проверки doqd 0.6.x: list ждёт до 8 с,
+// test — до 12 с, status последовательно делает два DNS-запроса по 10 с.
+// Короткий общий таймаут убивал эти команды раньше их собственного дедлайна.
+func commandTimeout(name string, args ...string) time.Duration {
+	if filepath.Base(name) == "doqd" && len(args) > 0 {
+		switch args[0] {
+		case "status":
+			return 30 * time.Second
+		case "list", "test":
+			return 15 * time.Second
+		}
+	}
+	return 3 * time.Second
+}
+
+// run выбирает таймаут по команде. Для остальных долгих операций
 // используйте runWithTimeout().
 func run(name string, args ...string) string {
-	return runWithTimeout(name, 3*time.Second, args...)
+	return runWithTimeout(name, commandTimeout(name, args...), args...)
+}
+
+// cappedOutput ограничивает память во время чтения, а не после завершения
+// процесса. Лишние байты принимаются и отбрасываются, чтобы не блокировать его.
+type cappedOutput struct {
+	text      strings.Builder
+	truncated bool
+}
+
+func (b *cappedOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := maxOutput - b.text.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.truncated = true
+	}
+	b.text.Write(p)
+	return n, nil
+}
+
+func (b *cappedOutput) String() string {
+	if b.truncated {
+		return b.text.String() + "\n... (обрезано)"
+	}
+	return b.text.String()
 }
 
 // runWithTimeout — как run(), но с настраиваемым таймаутом.
@@ -270,14 +309,19 @@ func runWithTimeout(name string, timeout time.Duration, args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
-	if len(out) > maxOutput {
-		out = append(out[:maxOutput], []byte("\n... (обрезано)")...)
+	// Не ждать бесконечно унаследованные дочерними процессами stdout/stderr.
+	cmd.WaitDelay = time.Second
+	var output cappedOutput
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err := cmd.Run()
+	out := stripANSI(output.String())
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("Ошибка: %s: превышено время ожидания (%s)\n%s", name, timeout, out)
 	}
 	if err != nil {
-		return fmt.Sprintf("Ошибка: %v\n%s", err, stripANSI(string(out)))
+		return fmt.Sprintf("Ошибка: %v\n%s", err, out)
 	}
-	return strings.TrimSpace(stripANSI(string(out)))
+	return strings.TrimSpace(out)
 }
 
 // ansiSequence — экранные sequence вида ESC [ <параметры> <финал>, которыми

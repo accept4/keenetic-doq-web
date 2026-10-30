@@ -1,0 +1,61 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - {target: arm64, arch: arm64}
+          - {target: arm, arch: arm, arm: '7'}
+          - {target: armv5, arch: arm, arm: '5'}
+          - {target: mipsle, arch: mipsle, mips: softfloat}
+          - {target: mips, arch: mips, mips: softfloat}
+          - {target: mips64le, arch: mips64le, mips: softfloat}
+          - {target: mips64, arch: mips64, mips: softfloat}
+          - {target: amd64, arch: amd64}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build static binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.arm }}
+          GOMIPS: ${{ matrix.mips }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.webVersion=git-${GITHUB_SHA::7}" -o "dist/doq-web-linux-${TARGET}" .
+          cd dist
+          sha256sum "doq-web-linux-${TARGET}" > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doq-web-linux-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
