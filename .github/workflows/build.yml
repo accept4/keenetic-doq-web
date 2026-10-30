@@ -59,3 +59,55 @@ jobs:
           name: doq-web-linux-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-raw-bins
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: raw-bins
+          path: published
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: doq-web-linux-*
+          path: bundle
+          merge-multiple: true
+      - name: Verify and publish installer binaries
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd bundle
+          for target in arm64 arm armv5 mipsle mips mips64le mips64 amd64; do
+            test -s "doq-web-linux-$target"
+          done
+          sha256sum doq-web-linux-* > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 8
+          sha256sum -c SHA256SUMS
+          chmod +x doq-web-linux-amd64
+          test "$(./doq-web-linux-amd64 -version)" = "doq-web git-${SOURCE_SHA:0:7}"
+          cd ../published
+          # A slower old run must not replace a newer main build.
+          current_main=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$current_main" != "$SOURCE_SHA" ]; then
+            echo "Skipping superseded build $SOURCE_SHA"
+            exit 0
+          fi
+          cp ../bundle/doq-web-linux-* ../bundle/SHA256SUMS .
+          printf '%s\n' "$SOURCE_SHA" > SOURCE_COMMIT
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add doq-web-linux-* SHA256SUMS SOURCE_COMMIT
+          if git diff --cached --quiet; then
+            echo 'Installer binaries are already up to date'
+            exit 0
+          fi
+          git commit -m "Publish tested binaries from $SOURCE_SHA"
+          git push origin HEAD:raw-bins
