@@ -11,23 +11,22 @@ import (
 
 func TestCommandTimeouts(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		args []string
-		want time.Duration
+		name     string
+		exe      string
+		args     []string
+		want     time.Duration
 	}{
-		{"doqd status", "doqd", []string{"status"}, 30 * time.Second},
-		{"absolute doqd list", "/opt/sbin/doqd", []string{"list"}, 15 * time.Second},
-		{"doqd test", "doqd", []string{"test", "dns.example"}, 15 * time.Second},
-		{"doqd hosts", "doqd", []string{"hosts", "status"}, 3 * time.Second},
-		{"doqd version", "doqd", []string{"-version"}, 3 * time.Second},
-		{"other executable", "other", []string{"list"}, 3 * time.Second},
-		{"doqd with no args", "doqd", nil, 3 * time.Second},
+		{name: "doqd status", exe: "doqd", args: []string{"status"}, want: 30 * time.Second},
+		{name: "absolute doqd list", exe: "/opt/sbin/doqd", args: []string{"list"}, want: 15 * time.Second},
+		{name: "doqd test", exe: "doqd", args: []string{"test", "dns.example"}, want: 15 * time.Second},
+		{name: "doqd hosts", exe: "doqd", args: []string{"hosts", "status"}, want: 3 * time.Second},
+		{name: "doqd version", exe: "doqd", args: []string{"-version"}, want: 3 * time.Second},
+		{name: "other executable", exe: "other", args: []string{"list"}, want: 3 * time.Second},
+		{name: "doqd with no args", exe: "doqd", want: 3 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := commandTimeout(tc.name, tc.args...); got != tc.want {
-				// Use the executable name in the actual function call; the table's
-				// name is only descriptive.
-				t.Fatalf("commandTimeout(%q, %v) = %s, want %s", tc.name, tc.args, got, tc.want)
+			if got := commandTimeout(tc.exe, tc.args...); got != tc.want {
+				t.Fatalf("commandTimeout(%q, %v) = %s, want %s", tc.exe, tc.args, got, tc.want)
 			}
 		})
 	}
@@ -69,16 +68,50 @@ func TestExternalKillIsNotReportedAsDeadline(t *testing.T) {
 	}
 }
 
+func TestCommandOutputAndErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix subprocess test")
+	}
+
+	t.Run("trims successful output", func(t *testing.T) {
+		path := shellCommand(t, "trim-output", "printf '  result  \\n'")
+		if got := runWithTimeout(path, time.Second); got != "result" {
+			t.Errorf("runWithTimeout() = %q, want %q", got, "result")
+		}
+	})
+
+	t.Run("includes output on nonzero exit", func(t *testing.T) {
+		path := shellCommand(t, "failed", "printf 'stdout\\n'\nprintf 'stderr\\n' >&2\nexit 7")
+		got := runWithTimeout(path, time.Second)
+		for _, want := range []string{"stdout", "stderr", "exit status 7"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output %q does not contain %q", got, want)
+			}
+		}
+	})
+}
+
+func TestUnavailableCommandIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has a platform-specific unavailable-command response")
+	}
+	t.Setenv("PATH", t.TempDir())
+	got := runWithTimeout("keenetic-doq-command-that-does-not-exist", time.Second)
+	if !strings.Contains(got, "недоступен") {
+		t.Errorf("unavailable command response = %q", got)
+	}
+}
+
 func TestCappedOutputBoundaries(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		writes []int
+		name          string
+		writes        []int
 		wantTruncated bool
 	}{
-		{"below limit", []int{maxOutput - 1}, false},
-		{"exact limit", []int{maxOutput}, false},
-		{"one byte over", []int{maxOutput, 1}, true},
-		{"over in chunks", []int{4096, maxOutput}, true},
+		{name: "below limit", writes: []int{maxOutput - 1}},
+		{name: "exact limit", writes: []int{maxOutput}},
+		{name: "one byte over", writes: []int{maxOutput, 1}, wantTruncated: true},
+		{name: "over in chunks", writes: []int{4096, maxOutput}, wantTruncated: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var b cappedOutput
@@ -94,8 +127,9 @@ func TestCappedOutputBoundaries(t *testing.T) {
 			if b.truncated != tc.wantTruncated {
 				t.Errorf("truncated = %v, want %v", b.truncated, tc.wantTruncated)
 			}
-			if got := strings.HasSuffix(b.String(), "\n... (обрезано)"); got != tc.wantTruncated {
-				t.Errorf("truncation marker = %v, want %v", got, tc.wantTruncated)
+			gotMarker := strings.HasSuffix(b.String(), "\n... (обрезано)")
+			if gotMarker != tc.wantTruncated {
+				t.Errorf("truncation marker = %v, want %v", gotMarker, tc.wantTruncated)
 			}
 		})
 	}
