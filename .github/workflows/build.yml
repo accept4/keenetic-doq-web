@@ -72,6 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: source
+      - uses: actions/checkout@v4
+        with:
           ref: raw-bins
           path: published
       - uses: actions/download-artifact@v4
@@ -84,8 +87,8 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          targets=$(jq -r '.include[].target' .github/targets.json)
-          target_count=$(jq '.include | length' .github/targets.json)
+          targets=$(jq -r '.include[].target' source/.github/targets.json)
+          target_count=$(jq '.include | length' source/.github/targets.json)
           cd bundle
           for target in $targets; do
             test -s "doq-web-linux-$target"
