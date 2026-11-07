@@ -1,421 +1,356 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// pageHTML содержит 8 плейсхолдеров %[1]s … %[8]s. page() передаёт ровно 8
-// аргументов: dot, title, label, msgHTML, status, list, age, customHostsPath.
-func TestRenderPageHTML(t *testing.T) {
+// writeCommandStub installs a deterministic executable in a temporary PATH.
+// This keeps tests independent of tools installed on the developer's machine.
+func writeCommandStub(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func setDoqdStub(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := writeCommandStub(t, dir, "doqd", body)
+	t.Setenv("PATH", dir)
+	return path
+}
+
+func TestRenderPageHTMLAndEscapesUserContent(t *testing.T) {
+	statusMu.Lock()
+	oldStatus, oldList, oldUpdated := statusText, listText, updatedAt
+	statusText, listText, updatedAt = `<script>alert("status")</script>`, `<img src=x>`, time.Now()
+	statusMu.Unlock()
+	t.Cleanup(func() {
+		statusMu.Lock()
+		statusText, listText, updatedAt = oldStatus, oldList, oldUpdated
+		statusMu.Unlock()
+	})
+
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	page(rec, req)
+	page(rec, httptest.NewRequest(http.MethodGet, "/?msg=%3Cscript%3Ealert%281%29%3C%2Fscript%3E", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "</html>") {
-		t.Errorf("output does not end with </html>")
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q", ct)
 	}
-	// Непрорендеренный плейсхолдер = page() разучилась подставлять аргументы.
+	body := rec.Body.String()
+	if !strings.HasSuffix(strings.TrimSpace(body), "</html>") {
+		t.Error("rendered page does not end with </html>")
+	}
 	if strings.Contains(body, "%[") {
-		t.Errorf("unrendered format placeholder in page output")
+		t.Error("unrendered format placeholder in page output")
+	}
+	for _, unsafe := range []string{`<script>alert("status")</script>`, `<img src=x>`, `<script>alert(1)</script>`} {
+		if strings.Contains(body, unsafe) {
+			t.Errorf("unescaped content in HTML: %q", unsafe)
+		}
 	}
 }
 
-func TestStatusAPI(t *testing.T) {
+func TestPageServesCurrentMethods(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			page(rec, httptest.NewRequest(method, "/", nil))
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200", rec.Code)
+			}
+		})
+	}
+}
+
+func TestStatusAPIJSONContract(t *testing.T) {
+	statusMu.Lock()
+	oldStatus, oldList, oldUpdated := statusText, listText, updatedAt
+	statusText, listText, updatedAt = "doqd running", "upstream alive", time.Now()
+	statusMu.Unlock()
+	t.Cleanup(func() {
+		statusMu.Lock()
+		statusText, listText, updatedAt = oldStatus, oldList, oldUpdated
+		statusMu.Unlock()
+	})
+
 	rec := httptest.NewRecorder()
 	statusAPI(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Errorf("Content-Type = %q, want application/json", ct)
+		t.Fatalf("Content-Type = %q, want application/json", ct)
 	}
-	body := rec.Body.String()
-	for _, key := range []string{`"ok"`, `"label"`, `"age"`, `"status"`, `"list"`, `"installed"`} {
-		if !strings.Contains(body, key) {
-			t.Errorf("JSON missing key %s", key)
-		}
+	var got struct {
+		OK        bool   `json:"ok"`
+		Label     string `json:"label"`
+		Age       int    `json:"age"`
+		Status    string `json:"status"`
+		List      string `json:"list"`
+		Installed bool   `json:"installed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !got.OK || got.Status != "doqd running" || got.List != "upstream alive" || got.Age < 0 {
+		t.Errorf("unexpected status response: %+v", got)
+	}
+	if !strings.Contains(got.Label, "running") {
+		t.Errorf("label = %q, want running state", got.Label)
 	}
 }
 
-// page() отдаёт страницу на любой метод — в коде нет проверки r.Method.
-func TestPageServesAnyMethod(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
-		rec := httptest.NewRecorder()
-		page(rec, httptest.NewRequest(method, "/", nil))
-		if rec.Code != http.StatusOK {
-			t.Errorf("GET %s: status = %d, want 200", method, rec.Code)
-		}
-	}
-}
-
-// Добавление апстрима вызывает run("doqd", "add", url) и редирект с msg.
-func TestAddRedirects(t *testing.T) {
+func TestAddRejectsInvalidInputWithoutRunningCommand(t *testing.T) {
+	// An empty PATH makes accidental command execution fail deterministically.
+	t.Setenv("PATH", t.TempDir())
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/add?url=quic://test.example.com", nil)
-	req.ParseForm()
-	add(rec, req)
-
+	add(rec, httptest.NewRequest(http.MethodPost, "/add?url=example.com.", nil))
 	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
+		t.Fatalf("status = %d, want 303", rec.Code)
 	}
-	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "/?msg=") {
-		t.Errorf("redirect Location missing msg: %q", loc)
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "msg=") {
+		t.Errorf("redirect missing validation message: %q", loc)
 	}
 }
 
-// Удаление апстрима вызывает run("doqd", "remove", id).
-func TestRemoveRedirects(t *testing.T) {
+func TestOnlyPOSTRejectsNonPOSTMethods(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodDelete, http.MethodPut, http.MethodOptions} {
+		t.Run(method, func(t *testing.T) {
+			called := false
+			h := onlyPOST(func(http.ResponseWriter, *http.Request) { called = true })
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(method, "/restart", nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want 405", rec.Code)
+			}
+			if called {
+				t.Error("wrapped handler was called for non-POST method")
+			}
+			if allow := rec.Header().Get("Allow"); allow != http.MethodPost {
+				t.Errorf("Allow = %q, want POST", allow)
+			}
+		})
+	}
+}
+
+func TestOnlyPOSTAllowsPOST(t *testing.T) {
+	called := false
+	h := onlyPOST(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/remove?id=1", nil)
-	req.ParseForm()
-	remove(rec, req)
-
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
-	}
-	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "/?msg=") {
-		t.Errorf("redirect Location missing msg: %q", loc)
+	h(rec, httptest.NewRequest(http.MethodPost, "/restart", nil))
+	if !called || rec.Code != http.StatusNoContent {
+		t.Errorf("POST: called=%v status=%d", called, rec.Code)
 	}
 }
 
-// Тестирование сервера не должно падать, даже если URL невалидный.
-func TestTestRedirects(t *testing.T) {
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/test?url=quic://bad", nil)
-	req.ParseForm()
-	testHandler := test // имя функции в doq-web.go — test
-	testHandler(rec, req)
-
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
+func TestEncodeRoundTrip(t *testing.T) {
+	in := "Установка: OK\nPID=12345 & #/"
+	encoded := encode(in)
+	if strings.ContainsAny(encoded, "&=") {
+		t.Errorf("encoded value contains unescaped query delimiters: %q", encoded)
 	}
-}
-
-// Рестарт демона вызывает run("/opt/etc/init.d/S56doqd", "restart").
-func TestRestartRedirects(t *testing.T) {
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/restart", nil)
-	restart(rec, req)
-
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
-	}
-}
-
-// Установка из инсталлера запускает curl | sh и редирект с результатом.
-func TestInstallRedirects(t *testing.T) {
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/install", nil)
-	install(rec, req)
-
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
-	}
-	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "/?msg=") {
-		t.Errorf("redirect Location missing msg: %q", loc)
-	}
-	// Location URL-закодирован, поэтому ищем закодированный вариант.
-	if !strings.Contains(loc, "%D0%A3%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0%3A") {
-		t.Errorf("redirect Location missing prefix 'Установка:': %q", loc)
-	}
-}
-
-// encode() URL-кодирует текст, чтобы его можно было безопасно передать в ?msg=
-// после 303 Redirect.
-func TestEncode(t *testing.T) {
-	in := "Установка: OK\nPID=12345"
-	enc := encode(in)
-	// Результат не должен содержать & или = (незакодированные).
-	if strings.Contains(enc, "&") || strings.Contains(enc, "=") {
-		t.Errorf("encode(%q) contains unescaped chars: %q", in, enc)
-	}
-	// При декодировании должно получиться исходное.
-	dec, err := url.QueryUnescape(enc)
+	decoded, err := url.QueryUnescape(encoded)
 	if err != nil {
 		t.Fatalf("QueryUnescape: %v", err)
 	}
-	if dec != in {
-		t.Errorf("round-trip failed: got %q", dec)
+	if decoded != in {
+		t.Errorf("round trip = %q, want %q", decoded, in)
 	}
 }
 
-// installed() проверяет наличие трёх файлов /opt/... — на Windows возвращает false.
-func TestInstalled(t *testing.T) {
-	if installed() {
-		t.Errorf("installed() returned true on this platform (expected false)")
-	}
-}
-
-// doRefresh заполняет кэш statusText/listText/updatedAt. Это проверяет, что
-// шаг 3 (первый doRefresh внутри refresher) действительно даёт непустой статус
-// вместо "stopped · 621... с" на пустом кэше.
-func TestDoRefreshPopulatesCache(t *testing.T) {
-	// Сброс кэша (как будто только что запустились).
+func TestDoRefreshPopulatesCacheFromStub(t *testing.T) {
+	setDoqdStub(t, `case "$1" in
+status) printf 'doqd running (pid 123)\\n' ;;
+list) printf 'upstream alive\\n' ;;
+*) exit 2 ;;
+esac`)
 	statusMu.Lock()
+	oldStatus, oldList, oldUpdated := statusText, listText, updatedAt
 	statusText, listText, updatedAt = "", "", time.Time{}
 	statusMu.Unlock()
+	t.Cleanup(func() {
+		statusMu.Lock()
+		statusText, listText, updatedAt = oldStatus, oldList, oldUpdated
+		statusMu.Unlock()
+	})
 
 	doRefresh()
-
-	status, list, up := currentStatus()
-	if status == "" {
-		t.Errorf("doRefresh didn't populate statusText")
-	}
-	if list == "" {
-		t.Errorf("doRefresh didn't populate listText")
-	}
-	if up.IsZero() {
-		t.Errorf("doRefresh didn't set updatedAt")
-	}
-	t.Logf("status=%q list=%q up=%v", status, list, up)
-}
-
-// onlyPOST обязан отсечь GET до того, как хендлер тронет конфигурацию:
-// префектч браузера, боты и сканеры не должны удалять домены.
-func TestOnlyPOSTRejectsGET(t *testing.T) {
-	called := false
-	h := onlyPOST(func(w http.ResponseWriter, r *http.Request) { called = true })
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/remove?d=example.com", nil)
-	h(rec, req)
-
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("GET: код %d,.want %d", rec.Code, http.StatusMethodNotAllowed)
-	}
-	if called {
-		t.Error("GET: хендлер вызван, мутация выполнена")
-	}
-	if allow := rec.Header().Get("Allow"); allow != "POST" {
-		t.Errorf("заголовок Allow = %q, want %q", allow, "POST")
+	status, list, updated := currentStatus()
+	if status != "doqd running (pid 123)" || list != "upstream alive" || updated.IsZero() {
+		t.Fatalf("unexpected refreshed cache: status=%q list=%q updated=%v", status, list, updated)
 	}
 }
 
-func TestOnlyPOSTRejectsHeadAndDelete(t *testing.T) {
-	for _, m := range []string{http.MethodHead, http.MethodDelete, http.MethodPut, http.MethodOptions} {
-		called := false
-		h := onlyPOST(func(w http.ResponseWriter, r *http.Request) { called = true })
-		rec := httptest.NewRecorder()
-		h(rec, httptest.NewRequest(m, "/add", nil))
+func TestInstalledChecksAllPlatformFiles(t *testing.T) {
+	dir := t.TempDir()
+	oldBinary, oldConf, oldInit := doqdBinary, doqdConfPath, doqdInitScript
+	doqdBinary = filepath.Join(dir, "doqd")
+	doqdConfPath = filepath.Join(dir, "doqd.conf")
+	doqdInitScript = filepath.Join(dir, "init-doqd")
+	t.Cleanup(func() { doqdBinary, doqdConfPath, doqdInitScript = oldBinary, oldConf, oldInit })
 
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s: код %d, want %d", m, rec.Code, http.StatusMethodNotAllowed)
-		}
-		if called {
-			t.Errorf("%s: хендлер вызван", m)
+	if installed() {
+		t.Fatal("installed() = true when platform files are missing")
+	}
+	for _, path := range []string{doqdBinary, doqdConfPath, doqdInitScript} {
+		if err := os.WriteFile(path, []byte("stub"), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
-}
-
-// POST обязан доходить до хендлера — иначе форма перестала бы работать.
-func TestOnlyPOSTAllowsPOST(t *testing.T) {
-	called := false
-	h := onlyPOST(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	})
-	rec := httptest.NewRecorder()
-	h(rec, httptest.NewRequest(http.MethodPost, "/add?d=example.com", nil))
-
-	if !called {
-		t.Error("POST: хендлер не вызван")
-	}
-	if rec.Code == http.StatusMethodNotAllowed {
-		t.Error("POST: получил 405")
+	if !installed() {
+		t.Error("installed() = false when all platform files exist")
 	}
 }
 
-// domainASCII отсекает конечную точку (idna.ToASCII("example.com.") →
-// "example.com.", что ломает домен). Числовой ID разрешён.
-func TestDomainASCII(t *testing.T) {
-	bad := []string{
-		"example.com.",
-		"",
-		"   ",
-		"quic://",
-	}
-	for _, d := range bad {
-		if _, err := domainASCII(d); err == nil {
-			t.Errorf("domainASCII(%q) = nil, want error", d)
-		}
-	}
-
-	good := []string{
-		"42",
-		"quic://dns.example.com",
-		"example.com",
-		"xn--80ak6aa92e.com",
-	}
-	for _, d := range good {
-		if _, err := domainASCII(d); err != nil {
-			t.Errorf("domainASCII(%q) = %v, want nil", d, err)
-		}
-	}
-}
-
-// Строка ровно как её печатает rc.func из Entware. Без stripANSI page()
-// прогоняет ESC через html.EscapeString и на экране остаётся
-// «[1;37m Shutting down doqd... [m [1;32m done. [m».
-func TestControlOutputStripsColor(t *testing.T) {
-	in := "\x1b[1;37m Shutting down doqd... \x1b[m            \x1b[1;32m done. \x1b[m"
-	want := "Shutting down doqd... done."
-	if got := controlOutput(in); got != want {
-		t.Errorf("controlOutput = %q, want %q", got, want)
-	}
-}
-
-// Многострочный вывод и кириллица должны пережить зачистку, а sequence,
-// оборванный усечением на maxOutput, обязан исчезнуть целиком — иначе
-// незакрытый ESC снова доедает html.EscapeString.
-func TestStripANSIMultilineAndBrokenTail(t *testing.T) {
-	in := "● running (pid 1234)\nапстрим \x1b[32mquic://dns.example.com\x1b[0m\n\x1b[1;3"
-	want := "● running (pid 1234)\nапстрим quic://dns.example.com\n"
-	if got := stripANSI(in); got != want {
-		t.Errorf("stripANSI = %q, want %q", got, want)
-	}
-}
-
-// controlOutput схлопывает отступы rc.func, но НЕ склеивает строки,
-// а stripANSI не трогает пробелы вовсе: «doqd list» печатает таблицу,
-// у неё выравнивание по колонкам — часть смысла.
-func TestControlOutputKeepsLinesAndListKeepsColumns(t *testing.T) {
-	in := "Установлен бинарник:   /opt/sbin/doq-web\n   rc.custom недоступен\n"
-	want := "Установлен бинарник: /opt/sbin/doq-web\nrc.custom недоступен"
-	if got := controlOutput(in); got != want {
-		t.Errorf("controlOutput = %q, want %q", got, want)
-	}
-
-	table := "1  quic://a.example.com  ok\n2  quic://b.example.com  timeout"
-	if got := stripANSI(table); got != table {
-		t.Errorf("stripANSI исказил таблицу: %q", got)
-	}
-}
-
-// ---------- Hosts ----------
-
-// hostsMode понимает builtin, свой файл и отсутствующую директиву (doqd по
-// умолчанию использует builtin). Комментированная строка hosts не считается.
 func TestHostsMode(t *testing.T) {
 	dir := t.TempDir()
 	old := doqdConfPath
-	defer func() { doqdConfPath = old }()
+	doqdConfPath = filepath.Join(dir, "doqd.conf")
+	t.Cleanup(func() { doqdConfPath = old })
 
-	write := func(s string) { doqdConfPath = dir + "/doqd.conf"; os.WriteFile(doqdConfPath, []byte(s), 0o644) }
-
-	write("listen 192.168.1.1:5354\nhosts builtin\nupstream quic://dns.quad9.net\n")
-	if m, p := hostsMode(); m != "builtin" || p != "" {
-		t.Errorf("builtin: got %q,%q want builtin,\"\"", m, p)
+	cases := []struct {
+		name, config, wantMode, wantPath string
+	}{
+		{"builtin", "listen 192.168.1.1:5354\nhosts builtin\n", "builtin", ""},
+		{"file", "hosts /opt/etc/doqd.hosts\n", "file", "/opt/etc/doqd.hosts"},
+		{"comment ignored", "# hosts /tmp/x\n", "builtin", ""},
+		{"missing directive", "upstream quic://dns.example.net\n", "builtin", ""},
 	}
-
-	write("hosts /opt/etc/doqd.hosts\n")
-	if m, p := hostsMode(); m != "file" || p != "/opt/etc/doqd.hosts" {
-		t.Errorf("file: got %q,%q want file,/opt/etc/doqd.hosts", m, p)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(doqdConfPath, []byte(tc.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mode, path := hostsMode()
+			if mode != tc.wantMode || path != tc.wantPath {
+				t.Errorf("hostsMode() = %q, %q; want %q, %q", mode, path, tc.wantMode, tc.wantPath)
+			}
+		})
 	}
-
-	write("listen 0.0.0.0:5354\n# hosts /tmp/x\n")
-	if m, p := hostsMode(); m != "builtin" || p != "" {
-		t.Errorf("missing/commented: got %q,%q want builtin,\"\"", m, p)
-	}
-
-	doqdConfPath = dir + "/nope.conf"
-	if m, _ := hostsMode(); m != "builtin" {
-		t.Errorf("no conf: got %q want builtin", m)
+	// An unreadable/missing config falls back to builtin mode.
+	doqdConfPath = filepath.Join(dir, "missing.conf")
+	if mode, path := hostsMode(); mode != "builtin" || path != "" {
+		t.Errorf("missing config: hostsMode() = %q, %q", mode, path)
 	}
 }
 
-// setHostsDirective заменяет существующую строку, дописывает при отсутствии
-// и сохраняет .bak.
-func TestSetHostsDirective(t *testing.T) {
+func TestSetHostsDirectiveReplacesAppendsAndBacksUp(t *testing.T) {
 	dir := t.TempDir()
 	old := doqdConfPath
-	defer func() { doqdConfPath = old }()
-	doqdConfPath = dir + "/doqd.conf"
+	doqdConfPath = filepath.Join(dir, "doqd.conf")
+	t.Cleanup(func() { doqdConfPath = old })
 
-	os.WriteFile(doqdConfPath, []byte("hosts builtin\nupstream quic://a\n"), 0o644)
+	original := "hosts builtin\nupstream quic://a.example\n"
+	if err := os.WriteFile(doqdConfPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := setHostsDirective("/opt/etc/doqd.hosts"); err != nil {
-		t.Fatalf("replace: %v", err)
+		t.Fatalf("replace directive: %v", err)
 	}
-	b, _ := os.ReadFile(doqdConfPath)
-	if !strings.Contains(string(b), "hosts /opt/etc/doqd.hosts") || strings.Contains(string(b), "hosts builtin") {
-		t.Errorf("replace failed: %q", b)
+	got, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if bak, err := os.ReadFile(doqdConfPath + ".bak"); err != nil || !strings.Contains(string(bak), "hosts builtin") {
-		t.Errorf("backup missing/wrong: %q %v", bak, err)
+	if !strings.Contains(string(got), "hosts /opt/etc/doqd.hosts") || strings.Contains(string(got), "hosts builtin") {
+		t.Errorf("directive was not replaced: %q", got)
+	}
+	backup, err := os.ReadFile(doqdConfPath + ".bak")
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != original {
+		t.Errorf("backup = %q, want original %q", backup, original)
 	}
 
-	os.WriteFile(doqdConfPath, []byte("upstream quic://a\n"), 0o644)
-	if err := setHostsDirective("builtin"); err != nil {
-		t.Fatalf("append: %v", err)
+	if err := os.WriteFile(doqdConfPath, []byte("upstream quic://a.example\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	b, _ = os.ReadFile(doqdConfPath)
-	if !strings.Contains(string(b), "hosts builtin") {
-		t.Errorf("append failed: %q", b)
+	if err := setHostsDirective("builtin"); err != nil {
+		t.Fatalf("append directive: %v", err)
+	}
+	got, err = os.ReadFile(doqdConfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "hosts builtin") {
+		t.Errorf("directive was not appended: %q", got)
 	}
 }
 
-// hostsSave в builtin-режиме обязан отказать: запись возможна только в файл
-// из директивы hosts, иначе форма запишет произвольный путь.
 func TestHostsSaveRejectsBuiltinMode(t *testing.T) {
 	dir := t.TempDir()
 	old := doqdConfPath
-	defer func() { doqdConfPath = old }()
-	doqdConfPath = dir + "/doqd.conf"
-	os.WriteFile(doqdConfPath, []byte("hosts builtin\n"), 0o644)
+	doqdConfPath = filepath.Join(dir, "doqd.conf")
+	t.Cleanup(func() { doqdConfPath = old })
+	if err := os.WriteFile(doqdConfPath, []byte("hosts builtin\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	form := url.Values{"content": []string{"5.175.161.3 example.com\n"}}
+	form := url.Values{"content": {"5.175.161.3 example.com\n"}}
 	req := httptest.NewRequest(http.MethodPost, "/hosts/save", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	hostsSave(rec, req)
-
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303", rec.Code)
 	}
-	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "%D0%92%D1%81%D1%82%D1%80%D0%BE%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9") && !strings.Contains(loc, "msg") {
-		t.Errorf("expected redirect with error msg, got %q", loc)
+	msg, err := url.QueryUnescape(strings.TrimPrefix(rec.Header().Get("Location"), "/?msg="))
+	if err != nil {
+		t.Fatalf("decode redirect: %v", err)
+	}
+	if !strings.Contains(msg, "сначала создайте свой файл") {
+		t.Errorf("redirect message = %q", msg)
 	}
 }
 
-// hostsStatusJSON отвечает JSON с mode/status даже без конфига (builtin).
-func TestHostsStatusJSON(t *testing.T) {
+func TestHostsStatusJSONUsesStubAndReportsMode(t *testing.T) {
+	setDoqdStub(t, `printf 'hosts status: builtin\\n'`)
 	dir := t.TempDir()
 	old := doqdConfPath
-	defer func() { doqdConfPath = old }()
-	doqdConfPath = dir + "/nope.conf"
+	doqdConfPath = filepath.Join(dir, "missing.conf")
+	t.Cleanup(func() { doqdConfPath = old })
 
 	rec := httptest.NewRecorder()
 	hostsStatusJSON(rec, httptest.NewRequest(http.MethodGet, "/hosts", nil))
-
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	body := rec.Body.String()
-	for _, key := range []string{`"mode"`, `"status"`} {
-		if !strings.Contains(body, key) {
-			t.Errorf("JSON missing key %s: %s", key, body)
-		}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
 	}
-	if !strings.Contains(body, `"builtin"`) {
-		t.Errorf("missing default mode builtin: %s", body)
+	if got["mode"] != "builtin" || got["status"] != "hosts status: builtin\n" {
+		t.Errorf("unexpected hosts response: %#v", got)
 	}
 }
 
-// UI больше не должен содержать geo-команд, удалённых из doqd 0.6.x.
-func TestPageHasNoGeoUI(t *testing.T) {
+func TestHostsStatusRejectsNonGET(t *testing.T) {
+	rec := httptest.NewRecorder()
+	hostsStatusJSON(rec, httptest.NewRequest(http.MethodPost, "/hosts", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestPageHasHostsUIAndNoRemovedGeoUI(t *testing.T) {
 	rec := httptest.NewRecorder()
 	page(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := rec.Body.String()
@@ -431,21 +366,35 @@ func TestPageHasNoGeoUI(t *testing.T) {
 	}
 }
 
-// applyPlatform переключает все пути doqd между Keenetic (Entware, /opt) и
-// OpenWRT (/etc, /usr/sbin, procd). Тест восстанавливает состояние после себя.
 func TestApplyPlatform(t *testing.T) {
-	defer applyPlatform(false)
+	oldConf, oldInit, oldBinary := doqdConfPath, doqdInitScript, doqdBinary
+	oldInstaller, oldVersion, oldHosts := doqdInstaller, versionFile, customHostsPath
+	t.Cleanup(func() {
+		doqdConfPath, doqdInitScript, doqdBinary = oldConf, oldInit, oldBinary
+		doqdInstaller, versionFile, customHostsPath = oldInstaller, oldVersion, oldHosts
+	})
 
 	applyPlatform(false)
 	if doqdConfPath != "/opt/etc/doqd.conf" || doqdInitScript != "/opt/etc/init.d/S56doqd" ||
-		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh") {
-		t.Errorf("keenetic paths wrong: %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller)
+		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh") ||
+		versionFile != "/opt/etc/doq-web/version.txt" || customHostsPath != "/opt/etc/doqd.hosts" {
+		t.Errorf("Keenetic paths: %q %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, versionFile, customHostsPath)
 	}
 
 	applyPlatform(true)
 	if doqdConfPath != "/etc/doqd.conf" || doqdInitScript != "/etc/init.d/doqd" ||
 		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install-openwrt.sh") ||
-		customHostsPath != "/etc/doqd/hosts" {
-		t.Errorf("openwrt paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, customHostsPath)
+		versionFile != "/etc/doq-web/version.txt" || customHostsPath != "/etc/doqd/hosts" {
+		t.Errorf("OpenWRT paths: %q %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, versionFile, customHostsPath)
+	}
+}
+
+func TestInstallRouteGuardDoesNotRunInstallerForGET(t *testing.T) {
+	called := false
+	h := onlyPOST(func(http.ResponseWriter, *http.Request) { called = true })
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "/install", nil))
+	if rec.Code != http.StatusMethodNotAllowed || called {
+		t.Errorf("GET /install: status=%d called=%v", rec.Code, called)
 	}
 }

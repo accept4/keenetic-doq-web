@@ -12,18 +12,24 @@ import (
 func TestCommandTimeouts(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		arg  string
+		args []string
 		want time.Duration
 	}{
-		{"doqd", "status", 30 * time.Second},
-		{"/opt/sbin/doqd", "list", 15 * time.Second},
-		{"doqd", "test", 15 * time.Second},
-		{"doqd", "-version", 3 * time.Second},
-		{"other", "list", 3 * time.Second},
+		{"doqd status", "doqd", []string{"status"}, 30 * time.Second},
+		{"absolute doqd list", "/opt/sbin/doqd", []string{"list"}, 15 * time.Second},
+		{"doqd test", "doqd", []string{"test", "dns.example"}, 15 * time.Second},
+		{"doqd hosts", "doqd", []string{"hosts", "status"}, 3 * time.Second},
+		{"doqd version", "doqd", []string{"-version"}, 3 * time.Second},
+		{"other executable", "other", []string{"list"}, 3 * time.Second},
+		{"doqd with no args", "doqd", nil, 3 * time.Second},
 	} {
-		if got := commandTimeout(tc.name, tc.arg); got != tc.want {
-			t.Errorf("%s %s: got %s, want %s", tc.name, tc.arg, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandTimeout(tc.name, tc.args...); got != tc.want {
+				// Use the executable name in the actual function call; the table's
+				// name is only descriptive.
+				t.Fatalf("commandTimeout(%q, %v) = %s, want %s", tc.name, tc.args, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -33,25 +39,25 @@ func shellCommand(t *testing.T, name, body string) string {
 		t.Skip("Unix subprocess test")
 	}
 	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0700); err != nil {
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-// Regression: a slow list used to be killed after 3 s, before it printed its table.
 func TestSlowListCompletes(t *testing.T) {
 	path := shellCommand(t, "doqd", "sleep 3.2\nprintf 'upstream alive\\n'")
+	// commandTimeout chooses its long timeout by executable basename.
 	if got := run(path, "list"); got != "upstream alive" {
 		t.Fatalf("slow list: %q", got)
 	}
 }
 
-func TestCommandDeadlineIsReported(t *testing.T) {
+func TestCommandDeadlineIsReportedWithPartialOutput(t *testing.T) {
 	path := shellCommand(t, "slow", "printf 'partial output\\n'\nexec sleep 5")
 	got := runWithTimeout(path, 50*time.Millisecond)
 	if !strings.Contains(got, "превышено время ожидания") || !strings.Contains(got, "partial output") || strings.Contains(got, "signal: killed") {
-		t.Fatalf("timeout lost cause or output: %q", got)
+		t.Fatalf("timeout lost cause or partial output: %q", got)
 	}
 }
 
@@ -63,15 +69,34 @@ func TestExternalKillIsNotReportedAsDeadline(t *testing.T) {
 	}
 }
 
-func TestCappedOutput(t *testing.T) {
-	var b cappedOutput
-	for i := 0; i < 100; i++ {
-		p := []byte(strings.Repeat("x", 4096))
-		if n, err := b.Write(p); n != len(p) || err != nil {
-			t.Fatalf("Write = %d, %v", n, err)
-		}
-	}
-	if b.text.Len() != maxOutput || !strings.HasSuffix(b.String(), "\n... (обрезано)") {
-		t.Fatalf("output not capped: %d bytes", b.text.Len())
+func TestCappedOutputBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		writes []int
+		wantTruncated bool
+	}{
+		{"below limit", []int{maxOutput - 1}, false},
+		{"exact limit", []int{maxOutput}, false},
+		{"one byte over", []int{maxOutput, 1}, true},
+		{"over in chunks", []int{4096, maxOutput}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var b cappedOutput
+			for _, size := range tc.writes {
+				p := []byte(strings.Repeat("x", size))
+				if n, err := b.Write(p); n != len(p) || err != nil {
+					t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(p))
+				}
+			}
+			if b.text.Len() > maxOutput {
+				t.Fatalf("buffer length = %d, exceeds %d", b.text.Len(), maxOutput)
+			}
+			if b.truncated != tc.wantTruncated {
+				t.Errorf("truncated = %v, want %v", b.truncated, tc.wantTruncated)
+			}
+			if got := strings.HasSuffix(b.String(), "\n... (обрезано)"); got != tc.wantTruncated {
+				t.Errorf("truncation marker = %v, want %v", got, tc.wantTruncated)
+			}
+		})
 	}
 }
