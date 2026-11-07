@@ -1,0 +1,12 @@
+{
+  "include": [
+    { "target": "arm64", "arch": "arm64" },
+    { "target": "arm", "arch": "arm", "arm": "7" },
+    { "target": "armv5", "arch": "arm", "arm": "5" },
+    { "target": "mipsle", "arch": "mipsle", "mips": "softfloat" },
+    { "target": "mips", "arch": "mips", "mips": "softfloat" },
+    { "target": "mips64le", "arch": "mips64le", "mips": "softfloat" },
+    { "target": "mips64", "arch": "mips64", "mips": "softfloat" },
+    { "target": "amd64", "arch": "amd64" }
+  ]
+}

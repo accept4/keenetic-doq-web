@@ -21,20 +21,20 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: echo "matrix=$(jq -c . .github/targets.json)" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: test
+    needs: [test, targets]
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        include:
-          - {target: arm64, arch: arm64}
-          - {target: arm, arch: arm, arm: '7'}
-          - {target: armv5, arch: arm, arm: '5'}
-          - {target: mipsle, arch: mipsle, mips: softfloat}
-          - {target: mips, arch: mips, mips: softfloat}
-          - {target: mips64le, arch: mips64le, mips: softfloat}
-          - {target: mips64, arch: mips64, mips: softfloat}
-          - {target: amd64, arch: amd64}
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -84,12 +84,14 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          targets=$(jq -r '.include[].target' .github/targets.json)
+          target_count=$(jq '.include | length' .github/targets.json)
           cd bundle
-          for target in arm64 arm armv5 mipsle mips mips64le mips64 amd64; do
+          for target in $targets; do
             test -s "doq-web-linux-$target"
           done
           sha256sum doq-web-linux-* > SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 8
+          test "$(wc -l < SHA256SUMS)" -eq "$target_count"
           sha256sum -c SHA256SUMS
           chmod +x doq-web-linux-amd64
           test "$(./doq-web-linux-amd64 -version)" = "doq-web git-${SOURCE_SHA:0:7}"

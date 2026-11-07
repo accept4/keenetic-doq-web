@@ -28,6 +28,11 @@ func TestRenderPageHTML(t *testing.T) {
 	if strings.Contains(body, "%[") {
 		t.Errorf("unrendered format placeholder in page output")
 	}
+	for _, want := range []string{"themeToggle", "doq-web-theme", `data-theme="light"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page is missing theme support marker %q", want)
+		}
+	}
 }
 
 func TestStatusAPI(t *testing.T) {
@@ -48,14 +53,27 @@ func TestStatusAPI(t *testing.T) {
 	}
 }
 
-// page() отдаёт страницу на любой метод — в коде нет проверки r.Method.
-func TestPageServesAnyMethod(t *testing.T) {
+func TestPageAllowsGETOnly(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
 		rec := httptest.NewRecorder()
-		page(rec, httptest.NewRequest(method, "/", nil))
-		if rec.Code != http.StatusOK {
-			t.Errorf("GET %s: status = %d, want 200", method, rec.Code)
+		onlyGET(page)(rec, httptest.NewRequest(method, "/", nil))
+		want := http.StatusOK
+		if method != http.MethodGet {
+			want = http.StatusMethodNotAllowed
 		}
+		if rec.Code != want {
+			t.Errorf("%s: status = %d, want %d", method, rec.Code, want)
+		}
+	}
+}
+
+func TestOnlyGETRejectsOtherMethods(t *testing.T) {
+	called := false
+	h := onlyGET(func(http.ResponseWriter, *http.Request) { called = true })
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodHead, "/", nil))
+	if rec.Code != http.StatusMethodNotAllowed || called || rec.Header().Get("Allow") != "GET" {
+		t.Fatalf("HEAD: status=%d called=%t Allow=%q", rec.Code, called, rec.Header().Get("Allow"))
 	}
 }
 
@@ -96,7 +114,7 @@ func TestTestRedirects(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/test?url=quic://bad", nil)
 	req.ParseForm()
-	testHandler := test // имя функции в doq-web.go — test
+	testHandler := onlyPOST(test)
 	testHandler(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
@@ -115,22 +133,12 @@ func TestRestartRedirects(t *testing.T) {
 	}
 }
 
-// Установка из инсталлера запускает curl | sh и редирект с результатом.
-func TestInstallRedirects(t *testing.T) {
+// GET на установщике обязан отклоняться, не выполняя установочный скрипт.
+func TestInstallRejectsGETWithoutExecuting(t *testing.T) {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/install", nil)
-	install(rec, req)
-
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 (StatusSeeOther)", rec.Code)
-	}
-	loc := rec.Header().Get("Location")
-	if !strings.Contains(loc, "/?msg=") {
-		t.Errorf("redirect Location missing msg: %q", loc)
-	}
-	// Location URL-закодирован, поэтому ищем закодированный вариант.
-	if !strings.Contains(loc, "%D0%A3%D1%81%D1%82%D0%B0%D0%BD%D0%BE%D0%B2%D0%BA%D0%B0%3A") {
-		t.Errorf("redirect Location missing prefix 'Установка:': %q", loc)
+	onlyPOST(install)(rec, httptest.NewRequest(http.MethodGet, "/install", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
 	}
 }
 
@@ -438,13 +446,13 @@ func TestApplyPlatform(t *testing.T) {
 
 	applyPlatform(false)
 	if doqdConfPath != "/opt/etc/doqd.conf" || doqdInitScript != "/opt/etc/init.d/S56doqd" ||
-		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh") {
+		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh?ref=main") {
 		t.Errorf("keenetic paths wrong: %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller)
 	}
 
 	applyPlatform(true)
 	if doqdConfPath != "/etc/doqd.conf" || doqdInitScript != "/etc/init.d/doqd" ||
-		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install-openwrt.sh") ||
+		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install-openwrt.sh?ref=main") ||
 		customHostsPath != "/etc/doqd/hosts" {
 		t.Errorf("openwrt paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, customHostsPath)
 	}
