@@ -18,6 +18,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Escape literal percent signs in the Go HTML format template
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("ui.go")
+          source = p.read_text()
+          # Preserve fmt's indexed substitutions (%[1]s, etc.) and already
+          # escaped %% while escaping literal percentages in pageHTML.
+          fixed = re.sub(r"(?<!%)%(?![%\[0-9])", "%%", source)
+          p.write_text(fixed)
+          PY
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
@@ -41,6 +54,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Escape literal percent signs in the Go HTML format template
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("ui.go")
+          source = p.read_text()
+          fixed = re.sub(r"(?<!%)%(?![%\[0-9])", "%%", source)
+          p.write_text(fixed)
+          PY
       - name: Build static binary
         env:
           CGO_ENABLED: '0'
@@ -99,7 +123,6 @@ jobs:
           chmod +x doq-web-linux-amd64
           test "$(./doq-web-linux-amd64 -version)" = "doq-web git-${SOURCE_SHA:0:7}"
           cd ../published
-          # A slower old run must not replace a newer main build.
           current_main=$(git ls-remote origin refs/heads/main | cut -f1)
           if [ "$current_main" != "$SOURCE_SHA" ]; then
             echo "Skipping superseded build $SOURCE_SHA"
