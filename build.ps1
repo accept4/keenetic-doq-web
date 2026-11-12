@@ -54,6 +54,24 @@ go build $LDF -o dist/doq-web-linux-armv5 .
 if ($LASTEXITCODE -ne 0) { Write-Host "FAIL armv5"; exit 1 }
 Write-Host "OK  dist/doq-web-linux-armv5"
 
+# linux/386 (OpenWRT i386_pentium4, i386_pentium-mmx)
+$env:GOOS = "linux"; $env:GOARCH = "386"; $env:GOARM = ""; $env:GOMIPS = ""
+go build $LDF -o dist/doq-web-linux-386 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL 386"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-386"
+
+# linux/riscv64 (OpenWRT riscv64_*)
+$env:GOARCH = "riscv64"
+go build $LDF -o dist/doq-web-linux-riscv64 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL riscv64"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-riscv64"
+
+# linux/loong64 (OpenWRT loongarch64_*)
+$env:GOARCH = "loong64"
+go build $LDF -o dist/doq-web-linux-loong64 .
+if ($LASTEXITCODE -ne 0) { Write-Host "FAIL loong64"; exit 1 }
+Write-Host "OK  dist/doq-web-linux-loong64"
+
 # windows/amd64
 $env:GOOS = "windows"; $env:GOARCH = "amd64"; $env:GOMIPS = ""; $env:GOARM = ""
 go build $LDF -o dist/doq-web-windows-amd64.exe .

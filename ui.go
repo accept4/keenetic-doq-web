@@ -5,7 +5,6 @@ import (
 	"html"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -334,6 +333,13 @@ try {
 <main>
   %[4]s
 
+    <!-- datalist — подсказки DoQ-серверов для <input list="doqpresets"> -->
+    <datalist id="doqpresets">
+      <option value="quic://dns.hostux.net" label="доqd 0.6.5 по умолчанию">
+      <option value="quic://dns.quad9.net">
+      <option value="quic://dns.nextdns.io">
+    </datalist>
+
   <!-- Status -->
   <div class="card">
     <div class="card-header">
@@ -365,7 +371,7 @@ try {
         <form method="POST" action="/add">
           <label>DoQ URL</label>
           <div class="form-row">
-            <input type="text" name="url" placeholder="quic://dns.example.com" required>
+            <input type="text" name="url" placeholder="quic://dns.hostux.net" required list="doqpresets">
           </div>
           <label>Тип</label>
           <div class="form-row">
@@ -400,7 +406,7 @@ try {
       <form method="POST" action="/test">
         <label>DoQ URL</label>
         <div class="form-row">
-          <input type="text" name="url" placeholder="quic://dns.quad9.net" required>
+          <input type="text" name="url" placeholder="quic://dns.hostux.net" required list="doqpresets">
           <button class="btn btn-blue" type="submit">Test</button>
         </div>
       </form>
@@ -439,8 +445,37 @@ try {
         </form>
       </div>
       <p style="font-size:11px;color:var(--text2);margin-top:10px;">
-        Формат: <code>IP домен1 домен2 …</code> — точные имена, комментарии через #.
-        Reload — SIGHUP, перечитывает файл атомарно; ошибочный файл демон не применяет.
+        Формат: <code>IP домен1 домен2 …</code> — точные имена и маски
+        <code>*.example.com</code> (поддомены любой глубины, не сам домен).
+        Точное имя важнее маски; из нескольких масок — длиннее.
+        Маски <code>*.com</code> запрещены. Свой файл заменяет встроенный снимок.
+      </p>
+    </div>
+  </div>
+
+  <!-- Bootstrap — обычные DNS для резолва имён DoQ-апстримов -->
+  <div class="card">
+    <div class="card-header">
+      <span>Bootstrap DNS</span>
+      <span style="font-size:11px;color:var(--text2)" id="bootMode"></span>
+    </div>
+    <div class="card-body">
+      <div id="bootList" style="margin-bottom:12px;"></div>
+      <form method="POST" action="/bootstrap/add" id="bootAddForm">
+        <div class="form-row">
+          <input type="text" name="addr" placeholder="77.88.8.8:1253" required
+                 pattern="^[0-9a-fA-F:.]+(:[0-9]{1,5})?$"
+                 title="IP-адрес (опционально :порт)">
+          <button class="btn btn-primary" type="submit">+ Добавить</button>
+        </div>
+      </form>
+      <form method="POST" action="/bootstrap/reset" id="bootResetForm" style="display:inline;">
+        <button class="btn btn-orange" type="submit" id="bootResetBtn">↩ Встроенные адреса doqd</button>
+      </form>
+      <p style="font-size:11px;color:var(--text2);margin-top:10px;">
+        Только IP-адрес (имена запрещены — их пришлось бы резолвить через doqd).
+        Порт по умолчанию 53; при фильтрации udp/53 полезно задать порт выше 1024,
+        например <code>77.88.8.8:1253</code>. Пустой список — встроенные адреса doqd.
       </p>
     </div>
   </div>
@@ -462,7 +497,9 @@ try {
       return r.json();
     }).then(function (d) {
       if (modeEl) {
-        modeEl.textContent = d.mode === 'file' ? 'свой файл: ' + d.path : 'встроенный снимок';
+        var label = d.mode === 'file' ? 'свой файл: ' + d.path : 'встроенный снимок';
+        if (d.summary) { label += ' · ' + d.summary; }
+        modeEl.textContent = label;
       }
       if (pre) { pre.textContent = d.status || 'нет данных'; }
       if (d.mode === 'file') {
@@ -490,6 +527,62 @@ try {
   if (disableF) {
     disableF.addEventListener('submit', function (e) {
       if (!window.confirm('Вернуться на встроенный снимок hosts?\n\nДемон будет перезапущен.')) {
+        e.preventDefault();
+      }
+    });
+  }
+})();
+</script>
+
+<script>
+(function () {
+  // Bootstrap-карточка: список адресов с кнопками удаления + сброс. Данные с /bootstrap.
+  var list = document.getElementById('bootList');
+  var modeEl = document.getElementById('bootMode');
+  var resetF = document.getElementById('bootResetForm');
+  var resetB = document.getElementById('bootResetBtn');
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
+    });
+  }
+  function loadBoot() {
+    fetch('/bootstrap', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error('http'); }
+      return r.json();
+    }).then(function (d) {
+      if (modeEl) {
+        modeEl.textContent = d.mode === 'custom' ? 'свой список' : 'встроенные адреса doqd';
+      }
+      if (resetB) { resetB.style.display = d.mode === 'custom' ? '' : 'none'; }
+      if (!list) { return; }
+      var html = '';
+      for (var i = 0; i < d.addrs.length; i++) {
+        var a = d.addrs[i];
+        html += '<div class="form-row" style="align-items:center;margin-bottom:6px;">';
+        html += '<code style="flex:1;">' + esc(a) + '</code>';
+        if (d.mode === 'custom') {
+          html += '<button class="btn btn-red" type="submit" form="bootDel' + i + '" '
+                + 'style="padding:4px 10px;font-size:12px;">✕</button>';
+        }
+        html += '</div>';
+        if (d.mode === 'custom') {
+          html += '<form method="POST" action="/bootstrap/remove" id="bootDel' + i + '" style="display:none">'
+                + '<input type="hidden" name="addr" value="' + esc(a) + '"></form>';
+        }
+      }
+      if (d.mode === 'default') {
+        html = '<div style="font-size:12px;color:var(--text2);margin-bottom:6px;">Встроенные адреса doqd:</div>' + html;
+      }
+      list.innerHTML = html;
+    }).catch(function () {
+      if (list) { list.textContent = 'Не удалось получить bootstrap-адреса'; }
+    });
+  }
+  loadBoot();
+  if (resetF) {
+    resetF.addEventListener('submit', function (e) {
+      if (!window.confirm('Удалить директиву bootstrap и вернуть встроенные адреса doqd?\n\nДемон будет перезапущен.')) {
         e.preventDefault();
       }
     });
@@ -626,7 +719,7 @@ try {
         }
         if (d.latest) {
           if (verl) {
-            if (d.installed && d.installed === d.latest) {
+            if (d.upToDate) {
               verl.textContent = '●';
               verl.style.color = '#22c55e';
             } else {
@@ -690,7 +783,7 @@ func page(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dot, title, label := "var(--red)", "stopped", "● stopped"
-	if strings.Contains(status, "running") {
+	if daemonRunning(status) {
 		dot, title, label = "var(--green)", "running", "● running"
 	}
 	label += fmt.Sprintf(" · %d с", age)

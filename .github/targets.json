@@ -7,6 +7,9 @@
     { "target": "mips", "arch": "mips", "mips": "softfloat" },
     { "target": "mips64le", "arch": "mips64le", "mips": "softfloat" },
     { "target": "mips64", "arch": "mips64", "mips": "softfloat" },
-    { "target": "amd64", "arch": "amd64" }
+    { "target": "amd64", "arch": "amd64" },
+    { "target": "386", "arch": "386" },
+    { "target": "riscv64", "arch": "riscv64" },
+    { "target": "loong64", "arch": "loong64" }
   ]
 }

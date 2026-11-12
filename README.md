@@ -9,11 +9,12 @@
 - Статус `doqd` и версия (установленная / последняя из GitHub)
 - Управление апстримами: добавление (`upstream`, `fallback`, `--force`), удаление, тестирование
 - Hosts (подмена адресов): просмотр источника и числа правил, `check`/`reload`, экспорт встроенного снимка в свой файл, встроенный редактор с проверкой и откатом при ошибке
+- Bootstrap DNS: просмотр, добавление и удаление адресов из `doqd.conf` (IP:port, порт по умолчанию 53)
 - Безопасность: whitelist для `type`, валидация доменов, POST-only для опасных команд
 - Светлая и тёмная темы интерфейса с сохранением выбора в браузере
-- Кроссплатформенная сборка: GitHub Actions собирает бинарники для 8 архитектур при изменениях и при каждом релизе
+- Кроссплатформенная сборка: GitHub Actions собирает бинарники для 11 архитектур при изменениях и при каждом релизе
 
-> **Примечание.** Web-панель адаптирована под keenetic-doq 0.6.x (SmartDNS). Команды `geo`, `geo reselect`, `add-domain`/`remove-domain` и флаг `--geo` в апстриме удалены — вместо них директива `hosts builtin` / `hosts /путь/к/файлу` и подкоманды `doqd hosts status|check|export|reload`.
+> **Примечание.** Web-панель адаптирована под keenetic-doq 0.6.x (SmartDNS). Команды `geo`, `geo reselect`, `add-domain`/`remove-domain` и флаг `--geo` в апстриме удалены — вместо них директива `hosts builtin` / `hosts /путь/к/файлу` и подкоманды `doqd hosts status|check|export|reload`. С doqd 0.6.4 hosts-файл поддерживает wildcard-маски `*.example.com`.
 
 ## Установка на Keenetic
 
@@ -79,7 +80,7 @@ wget -qO- https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/uninst
 
 ## Сборка из исходников
 
-Нужна версия Go, указанная в `go.mod` (или новее). Собирает статические бинарники для 8 платформ:
+Нужна версия Go, указанная в `go.mod` (или новее). Собирает статические бинарники для 11 платформ:
 
 ```sh
 # Windows (PowerShell)
@@ -96,16 +97,19 @@ CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
 |---|---|---|---|---|
 | aarch64 | `arm64` | — | `aarch64-k3.10` | `aarch64_*` |
 | ARM v7 | `arm` | `GOARM=7` | `armv7sf-k3.2` | `arm_cortex-a*_vfp*`, `arm_cortex-a*_neon*` |
-| ARM v5 | `arm` | `GOARM=5` | `armv5sf-k3.2` | прочие `arm_*` |
+| ARM v5 | `arm` | `GOARM=5` | `armv5sf-k3.2` | прочие `arm_*` (без FPU) |
 | MIPS little-endian | `mipsle` | `softfloat` | `mipselsf-k3.4` | `mipsel_*` |
 | MIPS big-endian | `mips` | `softfloat` | `mipssf-k3.4` | `mips_*` |
 | MIPS64 little-endian | `mips64le` | `softfloat` | `mips64elsf-k5.0` | `mips64el_*` |
 | MIPS64 big-endian | `mips64` | `softfloat` | `mips64sf-k5.0` | `mips64_*` |
 | x86_64 | `amd64` | — | `x64-k3.2` | `x86_64` |
+| i386 | `386` | — | — | `i386_pentium4`, `i386_pentium-mmx` |
+| RISC-V 64 | `riscv64` | — | — | `riscv64_*` |
+| LoongArch 64 | `loong64` | — | — | `loongarch64_*` |
 
-Go не собирает панели под `riscv64`, `i386`, `loong64`, ARMv4 и armeb —
-на этих платформах doqd (апстрим) работает, а панель — нет; поможет только
-перенос бинарника вручную.
+Go не собирает панели под ARMv4 (`arm_fa526`), ARM big-endian
+(`armeb_xscale`), PowerPC (`powerpc_*`) и ARC — на этих платформах doqd
+(апстрим) тоже не работает.
 
 ## Тесты
 
@@ -138,7 +142,7 @@ go test ./...
 
 Кнопки Install/Update скачивают установщик через GitHub API, сверяют его Git blob SHA и только после успешной проверки передают скрипт в `sh`.
 
-На роутере `doqd` слушает `:5354`, подставляет адреса из hosts для известных имён, а остальные резолвит через DoQ-апстримы. `doq-web` управляет апстримами (`doqd add/remove/list/test`) и файлом hosts (`doqd hosts ...`, директива `hosts` в конфиге). Платформа определяется по `/etc/openwrt_release`: на Keenetic конфиг doqd — `/opt/etc/doqd.conf`, на OpenWRT — `/etc/doqd.conf`.
+На роутере `doqd` слушает `:5354`, подставляет адреса из hosts для известных имён, а остальные резолвит через DoQ-апстримы. `doq-web` управляет апстримами (`doqd add/remove/list/test`), файлом hosts (`doqd hosts ...`, директива `hosts` в конфиге) и bootstrap-серверами (`bootstrap <IP>` — обычные DNS для резолва имён DoQ-апстримов, чтобы не резолвить их через сам doqd). Платформа определяется по `/etc/openwrt_release`: на Keenetic конфиг doqd — `/opt/etc/doqd.conf`, на OpenWRT — `/etc/doqd.conf`.
 
 ## Лицензия
 

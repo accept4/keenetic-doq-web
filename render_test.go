@@ -457,3 +457,192 @@ func TestApplyPlatform(t *testing.T) {
 		t.Errorf("openwrt paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, customHostsPath)
 	}
 }
+
+// daemonRunning должен отличать «running (pid 1234)» от «not running»:
+// подстрока "running" есть в обоих — на мёртвом демоне панель показывала
+// бы зелёный ● running.
+func TestDaemonRunning(t *testing.T) {
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{"daemon:          running (pid 1234)", true},
+		{"daemon:          running (pid 5678, uptime 2m3s)", true},
+		{"daemon:          not running", false},
+		{"listen: 192.168.1.1:5354   daemon: running (pid 42)", true},
+		{"listen: 192.168.1.1:5354   daemon: not running", false},
+		{"Ошибка: doqd недоступен", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := daemonRunning(tc.status); got != tc.want {
+			t.Errorf("daemonRunning(%q) = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}
+
+// hostsSummary разбирает счётчики из вывода `doqd hosts status`
+// обеих форматов: 0.6.4+ (имена + маски) и 0.6.0–0.6.3 (только имена).
+func TestHostsSummary(t *testing.T) {
+	tests := []struct {
+		status string
+		want   string
+	}{
+		{"hosts (configured): builtin, 405 names, 234 wildcard masks (not live)", "405 имён, 234 маски"},
+		{"hosts (configured): builtin, 1025 names (not live daemon state)", "1025 имён"},
+		{"hosts (configured): /etc/doqd/hosts, 3 names, 1 wildcard masks (not live)", "3 имени, 1 маска"},
+		{"hosts (configured): builtin, 21 names, 1 wildcard masks (not live)", "21 имя, 1 маска"},
+		{"ошибка парсинга", ""},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := hostsSummary(tc.status); got != tc.want {
+			t.Errorf("hostsSummary(%q) = %q, want %q", tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestRuPlural(t *testing.T) {
+	tests := []struct {
+		n    int
+		want string
+	}{
+		{0, "0 имён"}, {1, "1 имя"}, {2, "2 имени"}, {4, "4 имени"}, {5, "5 имён"},
+		{10, "10 имён"}, {11, "11 имён"}, {21, "21 имя"}, {101, "101 имя"}, {111, "111 имён"},
+	}
+	for _, tc := range tests {
+		if got := ruPlural(tc.n, "имя", "имени", "имён"); got != tc.want {
+			t.Errorf("ruPlural(%d) = %q, want %q", tc.n, got, tc.want)
+		}
+	}
+}
+
+// normalizeVer снимает «v» из GitHub-тега, чтобы «v0.6.5» и «0.6.5»
+// из doqd -version совпадали — иначе бейдж ●/↻ был бы вечным.
+func TestNormalizeVer(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"v0.6.5", "0.6.5"}, {"0.6.5", "0.6.5"}, {"", ""}, {"  v1.0.0 ", "1.0.0"},
+	} {
+		if got := normalizeVer(tc.in); got != tc.want {
+			t.Errorf("normalizeVer(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// UI должен упоминать wildcard-маски и Hostux — дефолтный DoQ-сервер
+// doqd 0.6.5.
+func TestPageMentionsMasksAndHostux(t *testing.T) {
+	rec := httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{"*.example.com", "dns.hostux.net"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page missing %q", want)
+		}
+	}
+}
+
+// ---------- Bootstrap ----------
+
+func TestBootstrapAddr(t *testing.T) {
+	tests := []struct {
+		in    string
+		want  string
+		wantE bool
+	}{
+		{"77.88.8.8:1253", "77.88.8.8:1253", false},
+		{"8.8.8.8", "8.8.8.8:53", false},
+		{"1.1.1.1:53", "1.1.1.1:53", false},
+		{"example.com", "", true},
+		{"999.999.999.999", "", true},
+		{"", "", true},
+	}
+	for _, tc := range tests {
+		got, err := bootstrapAddr(tc.in)
+		if tc.wantE {
+			if err == nil {
+				t.Errorf("bootstrapAddr(%q) = %q, want error", tc.in, got)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("bootstrapAddr(%q) error: %v", tc.in, err)
+			} else if got != tc.want {
+				t.Errorf("bootstrapAddr(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		}
+	}
+}
+
+func TestBootstrapModeDefault(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/nope.conf"
+	mode, addrs := bootstrapMode()
+	if mode != "default" || len(addrs) != 4 {
+		t.Errorf("mode = %q addrs = %v, want default 4", mode, addrs)
+	}
+}
+
+func TestBootstrapModeCustom(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/doqd.conf"
+	os.WriteFile(doqdConfPath, []byte("bootstrap 77.88.8.8:1253 1.1.1.1\n"), 0o644)
+	mode, addrs := bootstrapMode()
+	if mode != "custom" || len(addrs) != 2 {
+		t.Errorf("mode = %q addrs = %v, want custom 2", mode, addrs)
+	}
+}
+
+func TestSetBootstrapDirectives(t *testing.T) {
+	dir := t.TempDir()
+	old := doqdConfPath
+	defer func() { doqdConfPath = old }()
+	doqdConfPath = dir + "/doqd.conf"
+	os.WriteFile(doqdConfPath, []byte("listen 127.0.0.1:5354\nupstream quic://a\nbootstrap 1.1.1.1:53\n"), 0o644)
+
+	// Замена: добавляем адрес
+	if err := setBootstrapDirectives([]string{"1.1.1.1:53", "77.88.8.8:1253"}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(doqdConfPath)
+	if !strings.Contains(string(b), "bootstrap 1.1.1.1:53 77.88.8.8:1253") {
+		t.Errorf("replace failed: %q", b)
+	}
+	if bak, err := os.ReadFile(doqdConfPath + ".bak"); err != nil || !strings.Contains(string(bak), "bootstrap 1.1.1.1:53") {
+		t.Errorf("backup wrong: %v", err)
+	}
+
+	// Удаление: пустой список
+	if err := setBootstrapDirectives(nil); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(doqdConfPath)
+	if strings.Contains(string(b), "bootstrap ") {
+		t.Errorf("should have removed bootstrap directive: %q", b)
+	}
+}
+
+func TestBootstrapStatusJSON(t *testing.T) {
+	rec := httptest.NewRecorder()
+	bootstrapStatusJSON(rec, httptest.NewRequest(http.MethodGet, "/bootstrap", nil))
+	body := rec.Body.String()
+	for _, key := range []string{`"mode"`, `"addrs"`} {
+		if !strings.Contains(body, key) {
+			t.Errorf("JSON missing key %s", key)
+		}
+	}
+}
+
+func TestPageHasBootstrapCard(t *testing.T) {
+	rec := httptest.NewRecorder()
+	page(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{"bootList", "bootMode", "/bootstrap/add", "/bootstrap/remove", "/bootstrap/reset"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page missing bootstrap element %q", want)
+		}
+	}
+}

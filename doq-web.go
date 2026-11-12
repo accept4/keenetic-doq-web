@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -235,6 +236,22 @@ func doRefresh() {
 	statusMu.Unlock()
 }
 
+// daemonRunning определяет, жив ли демон, по выводу `doqd status`.
+// Искать подстроку "running" нельзя: остановленный демон печатает
+// «daemon:          not running», где "running" присутствует — панель
+// показывала бы зелёный ● running при мёртвом doqd. Живой процесс всегда
+// отвечает «daemon: running (pid N[, uptime ...])».
+func daemonRunning(status string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "daemon:"); ok {
+			return strings.HasPrefix(strings.TrimSpace(rest), "running")
+		}
+	}
+	// Формат вывода до 0.6.x и строка из `doqd list`
+	// («listen: ...   daemon: running (pid 123)») явного поля не имеют.
+	return strings.Contains(status, "running (pid")
+}
+
 func refresher() {
 	// Первый снимок — сразу при старте. Без этого первые refreshEvery
 	// секунд page() отдаёт пустой статус и возраст, отсчитанный от
@@ -403,6 +420,11 @@ func main() {
 	http.HandleFunc("/hosts/save", onlyPOST(hostsSave))
 	http.HandleFunc("/hosts/enable", onlyPOST(hostsEnableCustom))
 	http.HandleFunc("/hosts/disable", onlyPOST(hostsDisableCustom))
+	// Bootstrap — обычные DNS-серверы для резолва имён DoQ-апстримов.
+	http.HandleFunc("/bootstrap", onlyGET(bootstrapStatusJSON))
+	http.HandleFunc("/bootstrap/add", onlyPOST(bootstrapAdd))
+	http.HandleFunc("/bootstrap/remove", onlyPOST(bootstrapRemove))
+	http.HandleFunc("/bootstrap/reset", onlyPOST(bootstrapReset))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -487,7 +509,67 @@ func test(w http.ResponseWriter, r *http.Request) {
 // зависят от платформы (Keenetic — /opt, OpenWRT — /etc). doqdConfPath —
 // переменная: тесты подменяют её на временный файл.
 
-// hostsEditMax — потолок размера hosts-файла в редакторе. Встроенный снимок
+// hostsSummary — человекочитаемое число правил из `doqd hosts status`
+// («405 имён, 234 маски») или пустая строка, если вывод не распознан
+// (другая версия doqd, ошибка).
+//
+// 0.6.4+: hosts (configured): builtin, 405 names, 234 wildcard masks (not live)
+// 0.6.0-0.6.3: hosts (configured): builtin, 1025 names (not live)
+var hostsNamesRe = regexp.MustCompile(`(\d+)\s+names`)
+var hostsMasksRe = regexp.MustCompile(`(\d+)\s+wildcard masks`)
+
+func hostsSummary(status string) string {
+	n1 := firstInt(hostsNamesRe, status)
+	n2 := firstInt(hostsMasksRe, status)
+	if n1 == 0 {
+		return ""
+	}
+	s := ruPlural(n1, "имя", "имени", "имён")
+	if n2 > 0 {
+		s += ", " + ruPlural(n2, "маска", "маски", "масок")
+	}
+	return s
+}
+
+func firstInt(re *regexp.Regexp, s string) int {
+	m := re.FindStringSubmatch(s)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// ruPlural выбирает форму существительного по числу: 1 имя, 2 имени, 5 имён.
+// Возвращает строку с числом: «1 имя», «2 имени», «5 имён».
+func ruPlural(n int, one, few, many string) string {
+	var form string
+	switch {
+	case n%100 >= 11 && n%100 <= 14:
+		form = many
+	default:
+		switch n % 10 {
+		case 1:
+			form = one
+		case 2, 3, 4:
+			form = few
+		default:
+			form = many
+		}
+	}
+	return fmt.Sprintf("%d %s", n, form)
+}
+
+// normalizeVer снимает префикс «v» из тега GitHub.
+// `doqd -version` печатает «0.6.5», а GitHub-тег — «v0.6.5».
+// Без нормализации панель вечно показывала бы «доступно обновление».
+func normalizeVer(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
+}
+
 // ~1025 имён (< 100 КБ); 256 КБ с запасом, и protects RAM/flash на роутере.
 const hostsEditMax = 256 << 10
 
@@ -554,10 +636,14 @@ func hostsStatusJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode, path := hostsMode()
+	status := runWithTimeout("doqd", 10*time.Second, "hosts", "status")
 	resp := map[string]any{
 		"mode":   mode,
 		"path":   path,
-		"status": runWithTimeout("doqd", 10*time.Second, "hosts", "status"),
+		"status": status,
+	}
+	if s := hostsSummary(status); s != "" {
+		resp["summary"] = s
 	}
 	if mode == "file" && path != "" {
 		if b, err := os.ReadFile(path); err == nil {
@@ -732,6 +818,171 @@ func hostsDisableCustom(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode("Включён встроенный hosts, демон перезапущен:\n"+restartOut), 303)
 }
 
+// ---------- Bootstrap ----------
+//
+// doqd.conf хранит bootstrap-адреса в одной директиве:
+// bootstrap 77.88.8.8:53 8.8.8.8:53 1.1.1.1:53
+// Имена запрещены (только IP-литералы, чтобы не резолвить их через сам doqd).
+// Отсутствие директивы — доqd использует встроенные DefaultBootstrapServers.
+
+// defaultBootstrapServers — копия upstream.DefaultBootstrapServers (doqd 0.6.x).
+var defaultBootstrapServers = []string{"77.88.8.8:53", "77.88.8.8:1253", "8.8.8.8:53", "1.1.1.1:53"}
+
+// bootstrapAddr — канонический IP:port из значения директивы. Порт по умолчанию 53.
+func bootstrapAddr(v string) (string, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(v))
+	if err != nil {
+		host, port = strings.TrimSpace(v), "53"
+	}
+	if net.ParseIP(host) == nil {
+		return "", fmt.Errorf("bootstrap должен быть IP-адресом, а не именем: %q", v)
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+// bootstrapMode читает директиву bootstrap из конфига. Возвращает ("custom",
+// список) если директива есть, ("default", дефолты) — если её нет (doqd
+// берёт встроенные адреса).
+func bootstrapMode() (string, []string) {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return "default", defaultBootstrapServers
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "bootstrap" {
+			var addrs []string
+			for _, v := range f[1:] {
+				if a, err := bootstrapAddr(v); err == nil {
+					addrs = append(addrs, a)
+				}
+			}
+			if len(addrs) > 0 {
+				return "custom", addrs
+			}
+		}
+	}
+	return "default", defaultBootstrapServers
+}
+
+// setBootstrapDirectives заменяет директиву bootstrap в конфиге. Пустой список
+// удаляет её — doqd вернётся на встроенные адреса. Конфиг сохраняется в .bak.
+func setBootstrapDirectives(addrs []string) error {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	replaced := false
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "#") {
+			continue
+		}
+		if f := strings.Fields(t); len(f) >= 1 && f[0] == "bootstrap" {
+			if len(addrs) == 0 {
+				lines = append(lines[:i], lines[i+1:]...)
+			} else {
+				lines[i] = "bootstrap " + strings.Join(addrs, " ")
+			}
+			replaced = true
+			break
+		}
+	}
+	if !replaced && len(addrs) > 0 {
+		lines = append(lines, "bootstrap "+strings.Join(addrs, " "))
+	}
+	if err := os.WriteFile(doqdConfPath+".bak", b, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(doqdConfPath, []byte(strings.Join(lines, "\n")), 0o644)
+}
+
+func bootstrapStatusJSON(w http.ResponseWriter, r *http.Request) {
+	mode, addrs := bootstrapMode()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"mode":    mode,
+		"addrs":   addrs,
+		"default": defaultBootstrapServers,
+	})
+}
+
+func bootstrapAdd(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.FormValue("addr"))
+	addr, err := bootstrapAddr(raw)
+	if err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+		return
+	}
+	_, current := bootstrapMode()
+	for _, a := range current {
+		if a == addr {
+			http.Redirect(w, r, "/?msg="+encode("Адрес "+addr+" уже в списке"), 303)
+			return
+		}
+	}
+	if err := setBootstrapDirectives(append(current, addr)); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap "+addr+" добавлен, демон перезапущен:\n"+restartOut), 303)
+}
+
+func bootstrapRemove(w http.ResponseWriter, r *http.Request) {
+	addr, err := bootstrapAddr(strings.TrimSpace(r.FormValue("addr")))
+	if err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+		return
+	}
+	mode, current := bootstrapMode()
+	if mode != "custom" {
+		http.Redirect(w, r, "/?msg="+encode("Нельзя удалить: сейчас используются встроенные адреса doqd"), 303)
+		return
+	}
+	var next []string
+	removed := false
+	for _, a := range current {
+		if a == addr && !removed {
+			removed = true
+			continue
+		}
+		next = append(next, a)
+	}
+	if !removed {
+		http.Redirect(w, r, "/?msg="+encode("Адрес "+addr+" не найден"), 303)
+		return
+	}
+	if err := setBootstrapDirectives(next); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap "+addr+" удалён, демон перезапущен:\n"+restartOut), 303)
+}
+
+func bootstrapReset(w http.ResponseWriter, r *http.Request) {
+	mode, _ := bootstrapMode()
+	if mode != "custom" {
+		http.Redirect(w, r, "/?msg="+encode("Уже используются встроенные адреса doqd"), 303)
+		return
+	}
+	if err := setBootstrapDirectives(nil); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap сброшен на встроенные адреса, демон перезапущен:\n"+restartOut), 303)
+}
+
 func restart(w http.ResponseWriter, r *http.Request) {
 	out := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
@@ -756,7 +1007,7 @@ func encode(s string) string {
 	return url.QueryEscape(s)
 }
 
-// onlyPOST оборачивает mutационный хендлер и отвечает 405 на всё, что
+// onlyPOST оборачивает мутационный хендлер и отвечает 405 на всё, что
 // прилетело не POST. Без этого достаточно ссылки вида
 // <a href="/install?key=..."> или <img src="/restart"> на посторонней
 // странице, чтобы браузер от имени залогиненного админа перезапустил
@@ -839,15 +1090,16 @@ func domainASCII(v string) (string, error) {
 func statusAPI(w http.ResponseWriter, r *http.Request) {
 	status, list, up := currentStatus()
 	age := int(time.Since(up).Seconds())
+	running := daemonRunning(status)
 	label := "● stopped"
-	if strings.Contains(status, "running") {
+	if running {
 		label = "● running"
 	}
 	label += fmt.Sprintf(" · %d с", age)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"ok":        strings.Contains(status, "running"),
+		"ok":        running,
 		"label":     label,
 		"age":       age,
 		"status":    status,
@@ -988,9 +1240,11 @@ func versionAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	installed := installedDoqdVersion()
 	latest := latestUpstream()
+	ni, nl := normalizeVer(installed), normalizeVer(latest)
 	json.NewEncoder(w).Encode(map[string]any{
 		"installed": installed,
 		"latest":    latest,
+		"upToDate":  ni != "" && ni == nl,
 	})
 }
 

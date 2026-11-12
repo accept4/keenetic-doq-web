@@ -88,6 +88,9 @@ detect_arch() {
             arm_cortex-a*_neon*|arm_cortex-a*_vfp*) echo "armv7sf-k3.2" ;;
             arm*)      echo "armv5sf-k3.2" ;;
             x86_64*)   echo "x64-k3.2" ;;
+            i386*)     echo "i386" ;;
+            riscv64*)  echo "riscv64" ;;
+            loongarch64*) echo "loong64" ;;
             *)         echo "Ошибка: неизвестная архитектура OpenWRT: $DISTRIB_ARCH" >&2
                        echo "Go не собирает панели под эту платформу — используйте --local." >&2
                        exit 1 ;;
@@ -143,6 +146,9 @@ case "$TARGET" in
     mipselsf-k3.4)       BINARY="doq-web-linux-mipsle" ;;
     mipssf-k3.4)         BINARY="doq-web-linux-mips" ;;
     x64-k3.2)            BINARY="doq-web-linux-amd64" ;;
+    i386)                BINARY="doq-web-linux-386" ;;
+    riscv64)             BINARY="doq-web-linux-riscv64" ;;
+    loong64)             BINARY="doq-web-linux-loong64" ;;
     *)                   BINARY="doq-web-linux-mipsle" ;;
 esac
 
