@@ -18,7 +18,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Escape literal percent signs in the Go HTML format template
+      - name: Escape literal percent signs in the Go HTML template
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -26,10 +26,11 @@ jobs:
 
           p = Path("ui.go")
           source = p.read_text()
-          # Preserve fmt's indexed substitutions (%[1]s, etc.) and already
-          # escaped %% while escaping literal percentages in pageHTML.
-          fixed = re.sub(r"(?<!%)%(?![%\[0-9])", "%%", source)
-          p.write_text(fixed)
+          start = source.index("const pageHTML = `")
+          end = source.index("\n`\n\nfunc page(", start)
+          template = source[start:end]
+          template = re.sub(r"%(?![%\[])", "%%", template)
+          p.write_text(source[:start] + template + source[end:])
           PY
       - run: go vet ./...
       - run: go test -race -count=1 ./...
@@ -54,7 +55,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Escape literal percent signs in the Go HTML format template
+      - name: Escape literal percent signs in the Go HTML template
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -62,8 +63,11 @@ jobs:
 
           p = Path("ui.go")
           source = p.read_text()
-          fixed = re.sub(r"(?<!%)%(?![%\[0-9])", "%%", source)
-          p.write_text(fixed)
+          start = source.index("const pageHTML = `")
+          end = source.index("\n`\n\nfunc page(", start)
+          template = source[start:end]
+          template = re.sub(r"%(?![%\[])", "%%", template)
+          p.write_text(source[:start] + template + source[end:])
           PY
       - name: Build static binary
         env:
