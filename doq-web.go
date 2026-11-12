@@ -425,6 +425,7 @@ func main() {
 	http.HandleFunc("/bootstrap/add", onlyPOST(bootstrapAdd))
 	http.HandleFunc("/bootstrap/remove", onlyPOST(bootstrapRemove))
 	http.HandleFunc("/bootstrap/reset", onlyPOST(bootstrapReset))
+	http.HandleFunc("/bootstrap/save", onlyPOST(bootstrapSave))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -823,7 +824,7 @@ func hostsDisableCustom(w http.ResponseWriter, r *http.Request) {
 // doqd.conf хранит bootstrap-адреса в одной директиве:
 // bootstrap 77.88.8.8:53 8.8.8.8:53 1.1.1.1:53
 // Имена запрещены (только IP-литералы, чтобы не резолвить их через сам doqd).
-// Отсутствие директивы — доqd использует встроенные DefaultBootstrapServers.
+// Отсутствие директивы — доqd испол��зует встроенные DefaultBootstrapServers.
 
 // defaultBootstrapServers — копия upstream.DefaultBootstrapServers (doqd 0.6.x).
 var defaultBootstrapServers = []string{"77.88.8.8:53", "77.88.8.8:1253", "8.8.8.8:53", "1.1.1.1:53"}
@@ -966,6 +967,44 @@ func bootstrapRemove(w http.ResponseWriter, r *http.Request) {
 	restartOut := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
 	http.Redirect(w, r, "/?msg="+encode("Bootstrap "+addr+" удалён, демон перезапущен:\n"+restartOut), 303)
+}
+
+func bootstrapSave(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.FormValue("raw"))
+	if raw == "" {
+		if err := setBootstrapDirectives(nil); err != nil {
+			http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+			return
+		}
+		restartOut := controlOutput(run(doqdInitScript, "restart"))
+		requestRefreshAfter(refreshAfterRestart)
+		http.Redirect(w, r, "/?msg="+encode("Bootstrap очищен, демон перезапущен:\n"+restartOut), 303)
+		return
+	}
+
+	parts := strings.Fields(raw)
+	seen := make(map[string]struct{}, len(parts))
+	next := make([]string, 0, len(parts))
+	for _, field := range parts {
+		addr, err := bootstrapAddr(field)
+		if err != nil {
+			http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+			return
+		}
+		if _, ok := seen[addr]; ok {
+			http.Redirect(w, r, "/?msg="+encode("Ошибка: повторяющийся адрес "+addr), 303)
+			return
+		}
+		seen[addr] = struct{}{}
+		next = append(next, addr)
+	}
+	if err := setBootstrapDirectives(next); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap сохранён, демон перезапущен:\n"+restartOut), 303)
 }
 
 func bootstrapReset(w http.ResponseWriter, r *http.Request) {
@@ -1251,3 +1290,4 @@ func versionAPI(w http.ResponseWriter, r *http.Request) {
 // maxOutput ограничивает буфер вывода до 64 КБ, чтобы длинный вывод doqd
 // не жрал RAM на роутере с 32 МБ.
 const maxOutput = 64 << 10
+

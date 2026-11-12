@@ -88,7 +88,7 @@ try {
   [data-theme="light"] .logo span.keen { color: #007f9e; }
   [data-theme="light"] .logo span.doq { color: #1e293b; }
   .status-dot {
-    width: 10px; height: 10px; border-radius: 50%%;
+    width: 10px; height: 10px; border-radius: 50%;
     background: %[1]s;
     box-shadow: 0 0 8px %[1]s;
   }
@@ -438,7 +438,7 @@ try {
       <div id="hostsEditor" style="display:none;margin-top:14px;">
         <form method="POST" action="/hosts/save">
           <label>Файл <span id="hostsPath"></span> (полностью заменяет встроенный снимок)</label>
-          <textarea name="content" id="hostsContent" spellcheck="false" style="width:100%%;height:240px;background:#0d1117;border:1px solid var(--border);border-radius:8px;color:#c9d1d9;font-size:12px;line-height:1.5;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical;"></textarea>
+          <textarea name="content" id="hostsContent" spellcheck="false" style="width:100%;height:240px;background:#0d1117;border:1px solid var(--border);border-radius:8px;color:#c9d1d9;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;resize:vertical;"></textarea>
           <div class="form-row" style="margin-top:10px;">
             <button class="btn btn-primary" type="submit">💾 Сохранить и применить</button>
           </div>
@@ -461,6 +461,15 @@ try {
     </div>
     <div class="card-body">
       <div id="bootList" style="margin-bottom:12px;"></div>
+      <div id="bootEditor" style="margin-top:12px;">
+        <form method="POST" action="/bootstrap/save">
+          <label>Список bootstrap-адресов (IP[:port], через пробел)</label>
+          <textarea name="raw" id="bootRaw" spellcheck="false" style="width:100%;height:120px;background:#0d1117;border:1px solid var(--border);border-radius:8px;color:#c9d1d9;font-size:12px;line-height:1.5;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;resize:vertical;"></textarea>
+          <div class="form-row" style="margin-top:10px;">
+            <button class="btn btn-primary" type="submit">💾 Сохранить</button>
+          </div>
+        </form>
+      </div>
       <form method="POST" action="/bootstrap/add" id="bootAddForm">
         <div class="form-row">
           <input type="text" name="addr" placeholder="77.88.8.8:1253" required
@@ -536,13 +545,14 @@ try {
 
 <script>
 (function () {
-  // Bootstrap-карточка: список адресов с кнопками удаления + сброс. Данные с /bootstrap.
+  // Bootstrap-карточка: список адресов с кнопками удаления + редактор текста. Данные с /bootstrap.
   var list = document.getElementById('bootList');
   var modeEl = document.getElementById('bootMode');
   var resetF = document.getElementById('bootResetForm');
   var resetB = document.getElementById('bootResetBtn');
+  var bootRaw = document.getElementById('bootRaw');
   function esc(s) {
-    return String(s).replace(/[&<>"]/g, function (c) {
+    return String(s).replace(/[&<>\"]/g, function (c) {
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
     });
   }
@@ -555,6 +565,7 @@ try {
         modeEl.textContent = d.mode === 'custom' ? 'свой список' : 'встроенные адреса doqd';
       }
       if (resetB) { resetB.style.display = d.mode === 'custom' ? '' : 'none'; }
+      if (bootRaw) { bootRaw.value = (d.addrs || []).join(' '); }
       if (!list) { return; }
       var html = '';
       for (var i = 0; i < d.addrs.length; i++) {
@@ -612,7 +623,7 @@ try {
   if (form) {
     form.addEventListener('submit', function (e) {
       if (form.getAttribute('data-busy')) { e.preventDefault(); return; }
-      if (!window.confirm('Установить keenetic-doq на это устройство?\n\nСкрипт будет загружен из GitHub, проверен и запустит/перезапустит сервис.')) {
+      if (!window.confirm('Установить keenetic-doq на это устройство?\n\nСкрипт будет загружен из GitHub, проверен и запустит/перезапустит демон.')) {
         e.preventDefault();
         return;
       }
@@ -807,3 +818,4 @@ func page(w http.ResponseWriter, r *http.Request) {
 		log.Printf("render: %v", err)
 	}
 }
+
