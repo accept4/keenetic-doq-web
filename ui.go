@@ -103,6 +103,10 @@ try {
     margin-left: 4px;
     font-weight: 400;
   }
+  .ver-sep {
+    opacity: .45;
+    font-size: 11px;
+  }
   .version-tag.ver-new {
     color: #fdba74;
     background: #451a03;
@@ -308,11 +312,17 @@ try {
     <span class="keen">KEENETIC</span>
     <span class="doq">DOQ</span>
     <div class="status-dot" id="dot" title="%[2]s"></div>
-    <span class="version-tag" id="ver">—</span>
+    <span class="version-tag" id="ver" title="doqd">—</span>
     <span class="version-tag" id="verl" style="display:none">latest</span>
+    <span class="ver-sep" aria-hidden="true">·</span>
+    <span class="version-tag" id="webv" title="панель">—</span>
+    <span class="version-tag" id="webvl" style="display:none"></span>
   </div>
   <div class="header-actions">
     <button class="btn" id="themeToggle" type="button" aria-pressed="false">☀ Светлая тема</button>
+    <form method="POST" action="/webupdate" style="display:inline" id="webupdateform">
+      <button class="btn btn-install" id="webupdatebtn" type="submit">⇧ Панель</button>
+    </form>
     <form method="POST" action="/install" style="display:inline" id="installform">
       <button class="btn btn-install" id="installbtn" type="submit">⇩ Install</button>
     </form>
@@ -508,6 +518,9 @@ try {
   var lpr = document.getElementById('lpre');
   var ver = document.getElementById('ver');
   var verl = document.getElementById('verl');
+  var webv = document.getElementById('webv');
+  var webvl = document.getElementById('webvl');
+  var wform = document.getElementById('webupdateform');
   var form = document.getElementById('installform');
   var utype = document.getElementById('updateform');
   var timer = null;
@@ -532,6 +545,27 @@ try {
       setTimeout(function () {
         form.removeAttribute('data-busy');
         if (b) { b.disabled = false; b.textContent = 'Install'; }
+      }, 60000);
+    });
+  }
+
+  // /webupdate перезапускает саму панель (process замёрзнет на несколько секунд).
+  if (wform) {
+    wform.addEventListener('submit', function (e) {
+      if (wform.getAttribute('data-busy')) { e.preventDefault(); return; }
+      if (!window.confirm('Обновить панель keenetic-doq-web до последней версии?\n\nСкрипт скачается из GitHub и перезапустит веб-панель; интерфейс станет недоступен на 20–40 с.')) {
+        e.preventDefault();
+        return;
+      }
+      wform.setAttribute('data-busy', '1');
+      var b = wform.querySelector('button');
+      if (b) {
+        b.disabled = true;
+        b.textContent = 'обновление…';
+      }
+      setTimeout(function () {
+        wform.removeAttribute('data-busy');
+        if (b) { b.disabled = false; b.textContent = '⇧ Панель'; }
       }, 60000);
     });
   }
@@ -636,6 +670,36 @@ try {
             }
             verl.style.display = '';
           }
+        }
+      }
+      if (webv) {
+        webv.textContent = d.webCurrent || '?';
+        webv.title = 'панель keenetic-doq-web';
+        if (webvl) {
+          if (d.webLatest) {
+            if (d.webUpToDate) {
+              webvl.textContent = '●';
+              webvl.style.color = '#22c55e';
+              webvl.title = 'панель актуальна';
+              webvl.style.display = '';
+            } else {
+              webvl.textContent = '↻ ' + d.webLatest;
+              webvl.className = 'version-tag ver-new';
+              webvl.title = 'доступно обновление панели — нажмите «Панель»';
+              webvl.style.display = '';
+            }
+          } else {
+            webvl.style.display = 'none';
+          }
+        }
+        // Кнопка обновления панели нужна только когда есть новая версия или
+        // установка уже идёт; иначе прячем, чтобы не провоцировать перезапуск.
+        if (wform) {
+          wform.style.display = (d.webUpdateBusy || (d.webLatest && !d.webUpToDate)) ? 'inline' : 'none';
+        }
+        if (d.webUpdateBusy) {
+          var wb = wform ? wform.querySelector('button') : null;
+          if (wb) { wb.disabled = true; wb.textContent = 'обновление…'; }
         }
       }
     }).catch(function () {

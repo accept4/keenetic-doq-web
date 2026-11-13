@@ -110,6 +110,7 @@ jobs:
       - name: Publish binaries for the online installer
         env:
           SOURCE_SHA: ${{ github.sha }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           current_main=$(git ls-remote origin refs/heads/main | cut -f1)
@@ -118,11 +119,13 @@ jobs:
             exit 0
           fi
           cp release/doq-web-linux-* release/SHA256SUMS published/
+          printf '%s\n' "$GITHUB_REF_NAME" > VERSION
+          cp VERSION published/
           cd published
           printf '%s\n' "$SOURCE_SHA" > SOURCE_COMMIT
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add doq-web-linux-* SHA256SUMS SOURCE_COMMIT
+          git add doq-web-linux-* SHA256SUMS SOURCE_COMMIT VERSION
           if git diff --cached --quiet; then
             echo 'Installer binaries are already up to date'
             exit 0

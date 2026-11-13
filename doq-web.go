@@ -100,6 +100,32 @@ var (
 	latestFetched time.Time
 )
 
+// Панель умеет обновлять саму себя: кнопка «Обновить панель» скачивает её же
+// install.sh (из main) и запускает его — скрипт определяет платформу и
+// архитектуру, берёт бинарник из ветки raw-bins, сверяет SHA256/ELF и
+// перезапускает службу. Поэтому install.sh останавливает текущий процесс, а
+// страница уже получила ответ: установка продолжается осиротевшим sh.
+//
+// «Актуальная версия панели» берётся из файла VERSION в raw-bins, который CI
+// публикует тем же коммитом, что и сами бинарники. Он всегда соответствует
+// тому, что поставит install.sh, — в отличие от тега последнего релиза, и не
+// упирается в лимит анонимных запросов к API.
+const (
+	webRepo       = "accept4/keenetic-doq-web"
+	webInstaller  = "https://api.github.com/repos/accept4/keenetic-doq-web/contents/install.sh?ref=main"
+	webVersionURL = "https://raw.githubusercontent.com/accept4/keenetic-doq-web/raw-bins/VERSION"
+	webRefreshIt  = 6 * time.Hour
+)
+
+var (
+	webLatestMu      sync.Mutex
+	webLatestVer     string
+	webLatestFetched time.Time
+
+	webUpdateMu   sync.Mutex
+	webUpdateBusy bool
+)
+
 // latestUpstream — tag_name последнего релиза keenetic-doq. Пустая строка
 // означает "не удалось получить" (нет интернета/лимит API) — UI это
 // переживает молча.
@@ -133,6 +159,85 @@ func latestUpstream() string {
 	}
 	latestVer, latestFetched = rel.TagName, time.Now()
 	return latestVer
+}
+
+// latestWebRelease — версия панели, чьи бинарники лежат в raw-bins (файл
+// VERSION). Пустая строка — получить не удалось (нет сети); UI переживает это
+// молча. Кэшируется на webRefreshIt, как и версия апстрима.
+func latestWebRelease() string {
+	webLatestMu.Lock()
+	defer webLatestMu.Unlock()
+	if webLatestVer != "" && time.Since(webLatestFetched) < webRefreshIt {
+		return webLatestVer
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, webVersionURL, nil)
+	if err != nil {
+		return webLatestVer
+	}
+	req.Header.Set("User-Agent", "keenetic-doq-web")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return webLatestVer
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return webLatestVer
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return webLatestVer
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return webLatestVer
+	}
+	webLatestVer, webLatestFetched = v, time.Now()
+	return webLatestVer
+}
+
+// normalizeVer приводит версию к сравнению: снимает префикс «v». `doqd
+// -version` печатает «0.6.5», GitHub-тег — «v0.6.5»; VERSION в raw-bins для
+// релиза — «v1.1.0», а webVersion той же сборки — тоже «v1.1.0». Без снятия
+// префикса панель вечно показывала бы «доступно обновление».
+func normalizeVer(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
+}
+
+// webIsUpToDate — текущая сборка панели совпадает с той, что лежит в raw-bins.
+// Для dev-сборки (webVersion == "dev") актуальность неизвестна — считаем, что
+// обновление доступно, если удалось прочитать VERSION.
+func webIsUpToDate() bool {
+	cur := normalizeVer(webVersion)
+	if cur == "" || cur == "dev" {
+		return false
+	}
+	lat := normalizeVer(latestWebRelease())
+	return lat != "" && cur == lat
+}
+
+// claimWebUpdate занимает флаг обновления; false, если обновление уже идёт.
+func claimWebUpdate() bool {
+	webUpdateMu.Lock()
+	defer webUpdateMu.Unlock()
+	if webUpdateBusy {
+		return false
+	}
+	webUpdateBusy = true
+	return true
+}
+
+func releaseWebUpdate() {
+	webUpdateMu.Lock()
+	webUpdateBusy = false
+	webUpdateMu.Unlock()
+}
+
+func webUpdateRunning() bool {
+	webUpdateMu.Lock()
+	defer webUpdateMu.Unlock()
+	return webUpdateBusy
 }
 
 // installedDoqdVersion — версия doqd: сначала `doqd -version` (кэш 6 ч,
@@ -396,6 +501,7 @@ func main() {
 	http.HandleFunc("/start", onlyPOST(start))
 	http.HandleFunc("/install", onlyPOST(install))
 	http.HandleFunc("/update", onlyPOST(update))
+	http.HandleFunc("/webupdate", onlyPOST(webUpdate))
 	// Hosts (подмена адресов) — замена geo-domain из doqd <=0.5.x.
 	http.HandleFunc("/hosts", onlyGET(hostsStatusJSON))
 	http.HandleFunc("/hosts/check", onlyPOST(hostsCheck))
@@ -983,14 +1089,54 @@ func update(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?msg="+encode("Обновление:\n"+text), 303)
 }
 
+// webUpdate обновляет саму keenetic-doq-web: скачивает проверенный install.sh
+// своего репозитория и запускает его в фоновом процессе. Скрипт заменит
+// бинарник и перезапустит службу, попутно остановив текущий процесс, — поэтому
+// ответ уходит заранее, а установка продолжается уже осиротевшим sh.
+func webUpdate(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS == "windows" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: обновление панели недоступно на ПК"), 303)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	script, err := downloadVerifiedInstaller(ctx, webInstaller)
+	cancel()
+	if err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Не удалось получить установщик панели: "+err.Error()), 303)
+		return
+	}
+	if !claimWebUpdate() {
+		http.Redirect(w, r, "/?msg="+encode("Обновление панели уже выполняется — дождитесь перезапуска"), 303)
+		return
+	}
+	go runWebInstaller(script)
+	http.Redirect(w, r, "/?msg="+encode("Обновление keenetic-doq-web запущено.\nPанель перезапустится сама — обновите страницу через 20–40 с."), 303)
+}
+
+// runWebInstaller выполняет install.sh панели. stdout/stderr не перехватываются
+// в pipe: процесс-родитель умрёт вместе с svc stop, и перехват дал бы дочернему
+// sh EPIPE на середине установки. Наследование (или /dev/null при nil) безопасно.
+func runWebInstaller(script []byte) {
+	defer releaseWebUpdate()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh")
+	cmd.Stdin = bytes.NewReader(script)
+	_ = cmd.Run()
+}
+
 // versionAPI возвращает установленную и последнюю версию doqd в JSON.
 func versionAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	installed := installedDoqdVersion()
 	latest := latestUpstream()
 	json.NewEncoder(w).Encode(map[string]any{
-		"installed": installed,
-		"latest":    latest,
+		"installed":     installed,
+		"latest":        latest,
+		"webCurrent":    webVersion,
+		"webLatest":     latestWebRelease(),
+		"webUpToDate":   webIsUpToDate(),
+		"webUpdateBusy": webUpdateRunning(),
 	})
 }
 
