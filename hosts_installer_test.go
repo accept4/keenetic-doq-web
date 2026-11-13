@@ -57,7 +57,7 @@ func TestDownloadVerifiedInstaller(t *testing.T) {
 	script := []byte("#!/bin/sh\necho ok\n")
 	blobHeader := fmt.Sprintf("blob %d\x00", len(script))
 	sum := sha1.Sum(append([]byte(blobHeader), script...))
-	payload, err := json.Marshal(installerContents{
+	shaPayload, err := json.Marshal(installerContents{
 		Content:  base64.StdEncoding.EncodeToString(script),
 		Encoding: "base64",
 		SHA:      fmt.Sprintf("%x", sum),
@@ -65,36 +65,56 @@ func TestDownloadVerifiedInstaller(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
-			t.Errorf("Accept = %q", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(payload)
-	}))
-	defer server.Close()
 
-	got, err := downloadVerifiedInstaller(context.Background(), server.URL)
+	rawSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write(script)
+	}))
+	defer rawSrv.Close()
+
+	shaCount := 0
+	shaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		shaCount++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(shaPayload)
+	}))
+	defer shaSrv.Close()
+
+	got, err := downloadVerifiedInstaller(context.Background(), rawSrv.URL, shaSrv.URL)
 	if err != nil || string(got) != string(script) {
 		t.Fatalf("downloadVerifiedInstaller = %q, %v", got, err)
+	}
+	if shaCount == 0 {
+		t.Error("SHA endpoint was never called")
 	}
 }
 
 func TestDownloadVerifiedInstallerRejectsBadSHA(t *testing.T) {
-	payload, err := json.Marshal(installerContents{
-		Content:  base64.StdEncoding.EncodeToString([]byte("echo unverified")),
+	script := []byte("#!/bin/sh\necho ok\n")
+	badSHA := "0000000000000000000000000000000000000000"
+
+	shaPayload, err := json.Marshal(installerContents{
+		Content:  base64.StdEncoding.EncodeToString(script),
 		Encoding: "base64",
-		SHA:      "0000000000000000000000000000000000000000",
+		SHA:      badSHA,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(payload)
-	}))
-	defer server.Close()
 
-	if _, err := downloadVerifiedInstaller(context.Background(), server.URL); err == nil || !strings.Contains(err.Error(), "SHA") {
+	rawSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write(script)
+	}))
+	defer rawSrv.Close()
+
+	shaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(shaPayload)
+	}))
+	defer shaSrv.Close()
+
+	if _, err := downloadVerifiedInstaller(context.Background(), rawSrv.URL, shaSrv.URL); err == nil || !strings.Contains(err.Error(), "SHA") {
 		t.Fatalf("downloadVerifiedInstaller error = %v, want SHA mismatch", err)
 	}
 }

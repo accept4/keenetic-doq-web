@@ -446,14 +446,16 @@ func TestApplyPlatform(t *testing.T) {
 
 	applyPlatform(false)
 	if doqdConfPath != "/opt/etc/doqd.conf" || doqdInitScript != "/opt/etc/init.d/S56doqd" ||
-		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install.sh?ref=main") {
-		t.Errorf("keenetic paths wrong: %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller)
+		doqdBinary != "/opt/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/main/install.sh") ||
+		!strings.HasSuffix(doqdInstallerSHA, "/contents/install.sh?ref=main") {
+		t.Errorf("keenetic paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, doqdInstallerSHA)
 	}
 
 	applyPlatform(true)
 	if doqdConfPath != "/etc/doqd.conf" || doqdInitScript != "/etc/init.d/doqd" ||
-		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/install-openwrt.sh?ref=main") ||
+		doqdBinary != "/usr/sbin/doqd" || !strings.HasSuffix(doqdInstaller, "/main/install-openwrt.sh") ||
+		!strings.HasSuffix(doqdInstallerSHA, "/contents/install-openwrt.sh?ref=main") ||
 		customHostsPath != "/etc/doqd/hosts" {
-		t.Errorf("openwrt paths wrong: %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, customHostsPath)
+		t.Errorf("openwrt paths wrong: %q %q %q %q %q %q", doqdConfPath, doqdInitScript, doqdBinary, doqdInstaller, doqdInstallerSHA, customHostsPath)
 	}
 }

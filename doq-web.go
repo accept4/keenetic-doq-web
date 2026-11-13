@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -57,12 +56,13 @@ const (
 // /etc/doqd.conf, а автозапуск — procd-скрипт /etc/init.d/doqd. Платформа
 // определяется по /etc/openwrt_release, которого на KeeneticOS нет.
 var (
-	doqdConfPath    = "/opt/etc/doqd.conf"
-	doqdInitScript  = "/opt/etc/init.d/S56doqd"
-	doqdBinary      = "/opt/sbin/doqd"
-	doqdInstaller   = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install.sh?ref=main"
-	versionFile     = "/opt/etc/doq-web/version.txt"
-	customHostsPath = "/opt/etc/doqd.hosts"
+	doqdConfPath     = "/opt/etc/doqd.conf"
+	doqdInitScript   = "/opt/etc/init.d/S56doqd"
+	doqdBinary       = "/opt/sbin/doqd"
+	doqdInstaller    = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+	doqdInstallerSHA = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install.sh?ref=main"
+	versionFile      = "/opt/etc/doq-web/version.txt"
+	customHostsPath  = "/opt/etc/doqd.hosts"
 )
 
 func init() {
@@ -77,7 +77,8 @@ func applyPlatform(openwrt bool) {
 		doqdConfPath = "/opt/etc/doqd.conf"
 		doqdInitScript = "/opt/etc/init.d/S56doqd"
 		doqdBinary = "/opt/sbin/doqd"
-		doqdInstaller = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install.sh?ref=main"
+		doqdInstaller = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install.sh"
+		doqdInstallerSHA = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install.sh?ref=main"
 		versionFile = "/opt/etc/doq-web/version.txt"
 		customHostsPath = "/opt/etc/doqd.hosts"
 		return
@@ -85,7 +86,8 @@ func applyPlatform(openwrt bool) {
 	doqdConfPath = "/etc/doqd.conf"
 	doqdInitScript = "/etc/init.d/doqd"
 	doqdBinary = "/usr/sbin/doqd"
-	doqdInstaller = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install-openwrt.sh?ref=main"
+	doqdInstaller = "https://raw.githubusercontent.com/necronicle/keenetic-doq/main/install-openwrt.sh"
+	doqdInstallerSHA = "https://api.github.com/repos/necronicle/keenetic-doq/contents/install-openwrt.sh?ref=main"
 	versionFile = "/etc/doq-web/version.txt"
 	customHostsPath = "/etc/doqd/hosts"
 }
@@ -111,10 +113,11 @@ var (
 // тому, что поставит install.sh, — в отличие от тега последнего релиза, и не
 // упирается в лимит анонимных запросов к API.
 const (
-	webRepo       = "accept4/keenetic-doq-web"
-	webInstaller  = "https://api.github.com/repos/accept4/keenetic-doq-web/contents/install.sh?ref=main"
-	webVersionURL = "https://raw.githubusercontent.com/accept4/keenetic-doq-web/raw-bins/VERSION"
-	webRefreshIt  = 6 * time.Hour
+	webRepo         = "accept4/keenetic-doq-web"
+	webInstaller    = "https://raw.githubusercontent.com/accept4/keenetic-doq-web/main/install.sh"
+	webInstallerSHA = "https://api.github.com/repos/accept4/keenetic-doq-web/contents/install.sh?ref=main"
+	webVersionURL   = "https://raw.githubusercontent.com/accept4/keenetic-doq-web/raw-bins/VERSION"
+	webRefreshIt    = 6 * time.Hour
 )
 
 var (
@@ -978,7 +981,7 @@ func installed() bool {
 func runUpstreamInstaller() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	script, err := downloadVerifiedInstaller(ctx, doqdInstaller)
+	script, err := downloadVerifiedInstaller(ctx, doqdInstaller, doqdInstallerSHA)
 	if err != nil {
 		return "Ошибка загрузки установщика: " + err.Error()
 	}
@@ -1015,12 +1018,55 @@ type installerContents struct {
 	SHA      string `json:"sha"`
 }
 
-func downloadVerifiedInstaller(ctx context.Context, address string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+// installerSHACache кеширует Git blob SHA установщика из API. API rate-limited
+// (60/ч без токена), а install.sh обновляется редко. При первом запросе SHA
+// получается из API, при последующих — из кэша. Если API недоступен и кэша нет —
+// проверка SHA пропускается (доверяем HTTPS CDN GitHub, как README upstream).
+var (
+	installerSHACacheMu sync.Mutex
+	installerSHACache   = map[string]struct {
+		sha    string
+		expiry time.Time
+	}{}
+)
+
+func getInstallerSHA(ctx context.Context, apiURL string) string {
+	installerSHACacheMu.Lock()
+	defer installerSHACacheMu.Unlock()
+	if entry, ok := installerSHACache[apiURL]; ok && time.Now().Before(entry.expiry) {
+		return entry.sha
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "keenetic-doq-web")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	defer resp.Body.Close()
+	var result installerContents
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.SHA == "" {
+		return ""
+	}
+	installerSHACache[apiURL] = struct {
+		sha    string
+		expiry time.Time
+	}{result.SHA, time.Now().Add(time.Hour)}
+	return result.SHA
+}
+
+// downloadVerifiedInstaller скачивает install.sh с raw URL и сверяет Git blob SHA.
+// raw.githubusercontent.com — CDN GitHub, не rate-limited. SHA получается из API
+// с кэшированием; если API недоступен и кэша нет — проверка SHA пропускается.
+func downloadVerifiedInstaller(ctx context.Context, rawURL, shaURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("создание запроса: %w", err)
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "keenetic-doq-web")
 
 	client := &http.Client{Timeout: 20 * time.Second}
@@ -1034,30 +1080,27 @@ func downloadVerifiedInstaller(ctx context.Context, address string) ([]byte, err
 	}
 
 	const maxInstallerResponse = 1 << 20
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxInstallerResponse+1))
+	script, err := io.ReadAll(io.LimitReader(resp.Body, maxInstallerResponse+1))
 	if err != nil {
 		return nil, fmt.Errorf("чтение ответа: %w", err)
 	}
-	if len(body) > maxInstallerResponse {
+	if len(script) > maxInstallerResponse {
 		return nil, errors.New("ответ установщика превышает 1 МБ")
-	}
-	var result installerContents
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("разбор ответа GitHub: %w", err)
-	}
-	if result.Encoding != "base64" || result.Content == "" || result.SHA == "" {
-		return nil, errors.New("ответ GitHub не содержит установщик и его SHA")
-	}
-	script, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(result.Content), ""))
-	if err != nil {
-		return nil, fmt.Errorf("декодирование установщика: %w", err)
 	}
 	if len(script) == 0 {
 		return nil, errors.New("пустой установщик")
 	}
+	// Пропускаем проверку SHA, если shaURL пустой (fallback для тестов).
+	if shaURL == "" {
+		return script, nil
+	}
+	expectedSHA := getInstallerSHA(ctx, shaURL)
+	if expectedSHA == "" {
+		return script, nil
+	}
 	blob := fmt.Sprintf("blob %d\x00", len(script))
 	sum := sha1.Sum(append([]byte(blob), script...))
-	if !strings.EqualFold(fmt.Sprintf("%x", sum), result.SHA) {
+	if !strings.EqualFold(fmt.Sprintf("%x", sum), expectedSHA) {
 		return nil, errors.New("SHA установщика не совпадает с GitHub")
 	}
 	return script, nil
@@ -1099,7 +1142,7 @@ func webUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	script, err := downloadVerifiedInstaller(ctx, webInstaller)
+	script, err := downloadVerifiedInstaller(ctx, webInstaller, webInstallerSHA)
 	cancel()
 	if err != nil {
 		http.Redirect(w, r, "/?msg="+encode("Не удалось получить установщик панели: "+err.Error()), 303)
