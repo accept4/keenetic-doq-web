@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -512,6 +513,8 @@ func main() {
 	http.HandleFunc("/hosts/save", onlyPOST(hostsSave))
 	http.HandleFunc("/hosts/enable", onlyPOST(hostsEnableCustom))
 	http.HandleFunc("/hosts/disable", onlyPOST(hostsDisableCustom))
+	http.HandleFunc("/bootstrap", onlyGET(bootstrapGetHandler))
+	http.HandleFunc("/bootstrap/save", onlyPOST(bootstrapSave))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -595,6 +598,152 @@ func test(w http.ResponseWriter, r *http.Request) {
 // doqdConfPath, customHostsPath и versionFile объявлены в начале файла и
 // зависят от платформы (Keenetic — /opt, OpenWRT — /etc). doqdConfPath —
 // переменная: тесты подменяют её на временный файл.
+
+// ---------- Bootstrap (внешний DNS для разрешения upstream) ----------
+//
+// doqd 0.6.x добавляет директиву `bootstrap IP1 IP2 ...` (только IP-литералы,
+// порт по умолчанию 53). Без неё doqd резолвит имена upstream через себя —
+// петля. По умолчанию используются встроенные адреса; пользователь может
+// указать свои. На OpenWRT bootstrap также используется для обхода NTP.
+
+// bootstrapDefault — встроенные адреса doqd (совпадают с README апстрима).
+const bootstrapDefault = "77.88.8.8:53 77.88.8.8:1253 8.8.8.8:53 1.1.1.1:53"
+
+// bootstrapGet читает директиву bootstrap из doqd.conf. Пустая строка —
+// директивы нет (doqd использует встроенные адреса).
+func bootstrapGet() string {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "bootstrap" {
+			return strings.Join(f[1:], " ")
+		}
+	}
+	return ""
+}
+
+// setBootstrapDirective заменяет строку bootstrap в doqd.conf. Пустое значение
+// удаляет директиву (doqd вернётся на встроенные адреса). Оригинал — в .bak.
+func setBootstrapDirective(value string) error {
+	b, err := os.ReadFile(doqdConfPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	found := false
+	var out []string
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if !strings.HasPrefix(t, "#") {
+			if f := strings.Fields(t); len(f) >= 1 && f[0] == "bootstrap" {
+				if value != "" {
+					out = append(out, "bootstrap "+value)
+				}
+				found = true
+				continue
+			}
+		}
+		out = append(out, ln)
+	}
+	if value != "" && !found {
+		out = append(out, "bootstrap "+value)
+	}
+	if err := os.WriteFile(doqdConfPath+".bak", b, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(doqdConfPath, []byte(strings.Join(out, "\n")), 0o644)
+}
+
+// bootstrapIPValid проверяет, что s — IP-литерал (v4 или v6) с опциональным
+// портом. IPv4: "1.2.3.4" или "1.2.3.4:53". IPv6: "::1" или "[::1]:53".
+// Порт — целое 1–65535.
+func bootstrapIPValid(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	host := s
+	port := ""
+	if strings.HasPrefix(s, "[") {
+		// IPv6 в скобках: [::1]:53 или [::1]
+		idx := strings.Index(s, "]")
+		if idx < 0 {
+			return false
+		}
+		host = s[1:idx]
+		if idx+1 < len(s) {
+			if s[idx+1] != ':' {
+				return false
+			}
+			port = s[idx+2:]
+		}
+	} else if strings.Contains(s, ".") {
+		// IPv4: addr или addr:port
+		if i := strings.LastIndex(s, ":"); i > 0 {
+			host = s[:i]
+			port = s[i+1:]
+		}
+	}
+	// IPv6 без скобок и без порта — host = s как есть
+	if net.ParseIP(host) == nil {
+		return false
+	}
+	if port == "" {
+		return true
+	}
+	p, err := strconv.Atoi(port)
+	return err == nil && p >= 1 && p <= 65535
+}
+
+// bootstrapParseAndValidate разбирает строку из формы в список IP и валидирует
+// каждый. Возвращает каноническую строку "IP1 IP2 ..." или ошибку.
+func bootstrapParseAndValidate(raw string) (string, error) {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	for _, f := range fields {
+		if !bootstrapIPValid(f) {
+			return "", fmt.Errorf("некорректный IP-адрес: %s (только IP-литералы, опционально :порт)", f)
+		}
+	}
+	return strings.Join(fields, " "), nil
+}
+
+func bootstrapGetHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"bootstrap": bootstrapGet(),
+		"default":   bootstrapDefault,
+	})
+}
+
+func bootstrapSave(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.FormValue("servers"))
+	value, err := bootstrapParseAndValidate(raw)
+	if err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+		return
+	}
+	if err := setBootstrapDirective(value); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	if value == "" {
+		http.Redirect(w, r, "/?msg="+encode("Bootstrap сброшен на встроенные адреса, демон перезапущен:\n"+restartOut), 303)
+		return
+	}
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap обновлён ("+value+"), демон перезапущен:\n"+restartOut), 303)
+}
 
 // hostsEditMax — потолок размера hosts-файла в редакторе. Встроенный снимок
 // ~1025 имён (< 100 КБ); 256 КБ с запасом, и protects RAM/flash на роутере.

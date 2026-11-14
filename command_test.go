@@ -75,3 +75,95 @@ func TestCappedOutput(t *testing.T) {
 		t.Fatalf("output not capped: %d bytes", b.text.Len())
 	}
 }
+
+// ---------- Bootstrap tests ----------
+
+func TestBootstrapIPValid(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  bool
+	}{
+		{"77.88.8.8", true},
+		{"77.88.8.8:53", true},
+		{"77.88.8.8:1253", true},
+		{"8.8.8.8:53", true},
+		{"1.1.1.1:53", true},
+		{"::1", true},
+		{"::1:53", true},
+		{"2001:db8::1:53", true},
+		{"google.com", false},
+		{"", false},
+		{"  ", false},
+		{"77.88.8.8:abc", false},
+		{"77.88.8.8:0", false},
+		{"77.88.8.8:65536", false},
+	} {
+		got := bootstrapIPValid(tc.input)
+		if got != tc.want {
+			t.Errorf("bootstrapIPValid(%q) = %v, want %v", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestBootstrapParseAndValidate(t *testing.T) {
+	tests := []struct {
+		input      string
+		wantErr    bool
+		wantOutput string
+	}{
+		{"77.88.8.8:53 8.8.8.8:53", false, "77.88.8.8:53 8.8.8.8:53"},
+		{"", false, ""}, // пустая строка = сброс на встроенные
+		{"77.88.8.8:53", false, "77.88.8.8:53"},
+		{"google.com", true, ""},
+		{"77.88.8.8:53 google.com", true, ""},
+	}
+	for _, tc := range tests {
+		got, err := bootstrapParseAndValidate(tc.input)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("bootstrapParseAndValidate(%q) expected error, got %q", tc.input, got)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("bootstrapParseAndValidate(%q) unexpected error: %v", tc.input, err)
+			}
+			if got != tc.wantOutput {
+				t.Errorf("bootstrapParseAndValidate(%q) = %q, want %q", tc.input, got, tc.wantOutput)
+			}
+		}
+	}
+}
+
+func TestBootstrapDirective(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "doqd.conf")
+	original := []byte("listen 127.0.0.1:5354\nhosts builtin\nupstream quic://dns.example.com\n")
+	if err := os.WriteFile(conf, original, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Тестируем на временном конфиге
+	origConf := doqdConfPath
+	doqdConfPath = conf
+	defer func() { doqdConfPath = origConf }()
+
+	// bootstrapGet пустой, если директивы нет
+	if got := bootstrapGet(); got != "" {
+		t.Errorf("bootstrapGet() = %q, want empty", got)
+	}
+
+	// Добавляем директиву
+	if err := setBootstrapDirective("77.88.8.8:53 8.8.8.8:53"); err != nil {
+		t.Fatal(err)
+	}
+	if got := bootstrapGet(); got != "77.88.8.8:53 8.8.8.8:53" {
+		t.Errorf("bootstrapGet() = %q, want %q", got, "77.88.8.8:53 8.8.8.8:53")
+	}
+
+	// Удаляем директиву
+	if err := setBootstrapDirective(""); err != nil {
+		t.Fatal(err)
+	}
+	if got := bootstrapGet(); got != "" {
+		t.Errorf("bootstrapGet() = %q, want empty", got)
+	}
+}

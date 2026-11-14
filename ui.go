@@ -454,6 +454,21 @@ try {
       </p>
     </div>
   </div>
+
+  <!-- Bootstrap DNS -->
+  <div class="card">
+    <div class="card-header">Bootstrap — внешний DNS для upstream</div>
+    <div class="card-body">
+      <div class="form-row">
+        <input type="text" id="bootstrapInput" placeholder="77.88.8.8:53 8.8.8.8:53" style="flex:1;min-width:220px;">
+        <button class="btn btn-primary" type="button" id="bootstrapSaveBtn">💾 Сохранить</button>
+      </div>
+      <p style="font-size:11px;color:var(--text2);margin-top:10px;">
+        IP-адреса (только IP-литералы, опционально :порт). По умолчанию: встроенные.
+        Нужен для разрешения имён upstream без петли через doqd. На OpenWRT также обходит NTP.
+      </p>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -502,6 +517,41 @@ try {
       if (!window.confirm('Вернуться на встроенный снимок hosts?\n\nДемон будет перезапущен.')) {
         e.preventDefault();
       }
+    });
+  }
+})();
+</script>
+
+<script>
+(function () {
+  // Bootstrap DNS: чтение и сохранение директивы.
+  var bInput = document.getElementById('bootstrapInput');
+  var bBtn = document.getElementById('bootstrapSaveBtn');
+  function loadBootstrap() {
+    fetch('/bootstrap', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error('http'); }
+      return r.json();
+    }).then(function (d) {
+      if (bInput && d.bootstrap) {
+        bInput.value = d.bootstrap;
+      }
+    }).catch(function () {
+      if (bInput) { bInput.placeholder = 'ошибка загрузки'; }
+    });
+  }
+  loadBootstrap();
+  if (bBtn) {
+    bBtn.addEventListener('click', function () {
+      if (!window.confirm('Сохранить bootstrap и перезапустить doqd?\n\nДемон будет перезапущен.')) return;
+      var fd = new FormData();
+      fd.set('servers', bInput ? bInput.value.trim() : '');
+      fetch('/bootstrap/save', {method: 'POST', body: fd}).then(function (r) {
+        if (r.redirected) {
+          window.location.href = r.url;
+        }
+      }).catch(function () {
+        window.location.href = '/';
+      });
     });
   }
 })();
