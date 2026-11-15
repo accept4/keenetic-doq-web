@@ -1302,7 +1302,7 @@ func webUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go runWebInstaller(script)
-	http.Redirect(w, r, "/?msg="+encode("Обновление keenetic-doq-web запущено.\nPанель перезапустится сама — обновите страницу через 20–40 с."), 303)
+	http.Redirect(w, r, "/?msg="+encode("Обновление keenetic-doq-web запущено.\nПанель перезапустится сама — обновите страницу через 20–40 с."), 303)
 }
 
 // runWebInstaller выполняет install.sh панели. stdout/stderr не перехватываются
