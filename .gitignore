@@ -2,6 +2,7 @@
 /dist/
 /doq-web-*
 /doq-web.exe
+/keenetic-doq-web.exe
 *.exe~
 
 # Бэкапы, создаваемые install.sh при обновлении

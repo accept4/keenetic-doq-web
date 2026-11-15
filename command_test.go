@@ -109,26 +109,32 @@ func TestBootstrapParseAndValidate(t *testing.T) {
 	tests := []struct {
 		input      string
 		wantErr    bool
-		wantOutput string
+		wantOutput []string
 	}{
-		{"77.88.8.8:53 8.8.8.8:53", false, "77.88.8.8:53 8.8.8.8:53"},
-		{"", false, ""}, // пустая строка = сброс на встроенные
-		{"77.88.8.8:53", false, "77.88.8.8:53"},
-		{"google.com", true, ""},
-		{"77.88.8.8:53 google.com", true, ""},
+		{"77.88.8.8:53 8.8.8.8:53", false, []string{"77.88.8.8:53", "8.8.8.8:53"}},
+		{"", false, nil}, // пустая строка = сброс на встроенные
+		{"77.88.8.8:53", false, []string{"77.88.8.8:53"}},
+		{"google.com", true, nil},
+		{"77.88.8.8:53 google.com", true, nil},
 	}
 	for _, tc := range tests {
 		got, err := bootstrapParseAndValidate(tc.input)
 		if tc.wantErr {
 			if err == nil {
-				t.Errorf("bootstrapParseAndValidate(%q) expected error, got %q", tc.input, got)
+				t.Errorf("bootstrapParseAndValidate(%q) expected error, got %v", tc.input, got)
 			}
 		} else {
 			if err != nil {
 				t.Errorf("bootstrapParseAndValidate(%q) unexpected error: %v", tc.input, err)
 			}
-			if got != tc.wantOutput {
-				t.Errorf("bootstrapParseAndValidate(%q) = %q, want %q", tc.input, got, tc.wantOutput)
+			if len(got) != len(tc.wantOutput) {
+				t.Errorf("bootstrapParseAndValidate(%q) len=%d, want %d", tc.input, len(got), len(tc.wantOutput))
+				continue
+			}
+			for i := range got {
+				if got[i] != tc.wantOutput[i] {
+					t.Errorf("bootstrapParseAndValidate(%q)[%d] = %q, want %q", tc.input, i, got[i], tc.wantOutput[i])
+				}
 			}
 		}
 	}
@@ -147,23 +153,23 @@ func TestBootstrapDirective(t *testing.T) {
 	defer func() { doqdConfPath = origConf }()
 
 	// bootstrapGet пустой, если директивы нет
-	if got := bootstrapGet(); got != "" {
-		t.Errorf("bootstrapGet() = %q, want empty", got)
+	if got := bootstrapGet(); len(got) != 0 {
+		t.Errorf("bootstrapGet() = %v, want empty slice", got)
 	}
 
 	// Добавляем директиву
-	if err := setBootstrapDirective("77.88.8.8:53 8.8.8.8:53"); err != nil {
+	if err := setBootstrapDirective([]string{"77.88.8.8:53", "8.8.8.8:53"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := bootstrapGet(); got != "77.88.8.8:53 8.8.8.8:53" {
-		t.Errorf("bootstrapGet() = %q, want %q", got, "77.88.8.8:53 8.8.8.8:53")
+	if got := bootstrapGet(); len(got) != 2 || got[0] != "77.88.8.8:53" || got[1] != "8.8.8.8:53" {
+		t.Errorf("bootstrapGet() = %v, want [77.88.8.8:53 8.8.8.8:53]", got)
 	}
 
 	// Удаляем директиву
-	if err := setBootstrapDirective(""); err != nil {
+	if err := setBootstrapDirective(nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := bootstrapGet(); got != "" {
-		t.Errorf("bootstrapGet() = %q, want empty", got)
+	if got := bootstrapGet(); len(got) != 0 {
+		t.Errorf("bootstrapGet() = %v, want empty slice", got)
 	}
 }

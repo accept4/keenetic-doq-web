@@ -514,7 +514,9 @@ func main() {
 	http.HandleFunc("/hosts/enable", onlyPOST(hostsEnableCustom))
 	http.HandleFunc("/hosts/disable", onlyPOST(hostsDisableCustom))
 	http.HandleFunc("/bootstrap", onlyGET(bootstrapGetHandler))
-	http.HandleFunc("/bootstrap/save", onlyPOST(bootstrapSave))
+	http.HandleFunc("/bootstrap/add", onlyPOST(bootstrapAdd))
+	http.HandleFunc("/bootstrap/remove", onlyPOST(bootstrapRemove))
+	http.HandleFunc("/bootstrap/reset", onlyPOST(bootstrapReset))
 
 	// Порт поднимаем ПЕРВЫМ, статус добираем в фоне. Порядок важен: `doqd
 	// status` резолвит имя и через doqd, и через :53, а `doqd list` пробует
@@ -609,12 +611,12 @@ func test(w http.ResponseWriter, r *http.Request) {
 // bootstrapDefault — встроенные адреса doqd (совпадают с README апстрима).
 const bootstrapDefault = "77.88.8.8:53 77.88.8.8:1253 8.8.8.8:53 1.1.1.1:53"
 
-// bootstrapGet читает директиву bootstrap из doqd.conf. Пустая строка —
-// директивы нет (doqd использует встроенные адреса).
-func bootstrapGet() string {
+// bootstrapGet читает директиву bootstrap из doqd.conf. Возвращает массив
+// адресов; пустой массив — директивы нет (doqd использует встроенные).
+func bootstrapGet() []string {
 	b, err := os.ReadFile(doqdConfPath)
 	if err != nil {
-		return ""
+		return nil
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
@@ -623,15 +625,20 @@ func bootstrapGet() string {
 		}
 		f := strings.Fields(line)
 		if len(f) >= 2 && f[0] == "bootstrap" {
-			return strings.Join(f[1:], " ")
+			return f[1:]
 		}
 	}
-	return ""
+	return nil
 }
 
-// setBootstrapDirective заменяет строку bootstrap в doqd.conf. Пустое значение
+// bootstrapCount директивы bootstrap в doqd.conf (0 = нет, использовать встроенные).
+func bootstrapCount() int {
+	return len(bootstrapGet())
+}
+
+// setBootstrapDirective заменяет строку bootstrap в doqd.conf. Пустой массив
 // удаляет директиву (doqd вернётся на встроенные адреса). Оригинал — в .bak.
-func setBootstrapDirective(value string) error {
+func setBootstrapDirective(addrs []string) error {
 	b, err := os.ReadFile(doqdConfPath)
 	if err != nil {
 		return err
@@ -643,17 +650,17 @@ func setBootstrapDirective(value string) error {
 		t := strings.TrimSpace(ln)
 		if !strings.HasPrefix(t, "#") {
 			if f := strings.Fields(t); len(f) >= 1 && f[0] == "bootstrap" {
-				if value != "" {
-					out = append(out, "bootstrap "+value)
-				}
 				found = true
+				if len(addrs) > 0 {
+					out = append(out, "bootstrap "+strings.Join(addrs, " "))
+				}
 				continue
 			}
 		}
 		out = append(out, ln)
 	}
-	if value != "" && !found {
-		out = append(out, "bootstrap "+value)
+	if len(addrs) > 0 && !found {
+		out = append(out, "bootstrap "+strings.Join(addrs, " "))
 	}
 	if err := os.WriteFile(doqdConfPath+".bak", b, 0o644); err != nil {
 		return err
@@ -703,46 +710,162 @@ func bootstrapIPValid(s string) bool {
 }
 
 // bootstrapParseAndValidate разбирает строку из формы в список IP и валидирует
-// каждый. Возвращает каноническую строку "IP1 IP2 ..." или ошибку.
-func bootstrapParseAndValidate(raw string) (string, error) {
+// каждый. Возвращает срез адресов или ошибку. Пустой вход → пустой срез.
+func bootstrapParseAndValidate(raw string) ([]string, error) {
 	fields := strings.Fields(raw)
 	if len(fields) == 0 {
-		return "", nil
+		return nil, nil
 	}
 	for _, f := range fields {
 		if !bootstrapIPValid(f) {
-			return "", fmt.Errorf("некорректный IP-адрес: %s (только IP-литералы, опционально :порт)", f)
+			return nil, fmt.Errorf("некорректный IP-адрес: %s (только IP-литералы, опционально :порт)", f)
 		}
 	}
-	return strings.Join(fields, " "), nil
+	return fields, nil
 }
 
+// effectiveBootstrap возвращает фактически используемые doqd адреса: из конфига,
+// если директива есть, иначе встроенные по умолчанию.
+func effectiveBootstrap() []string {
+	addrs := bootstrapGet()
+	if len(addrs) > 0 {
+		return addrs
+	}
+	return bootstrapDefaultList
+}
+
+// bootstrapNormalize — канонический вид адреса для сравнения и хранения:
+// IPv6 приводится через net.IP.String, IPv4 остаётся как есть, порт сохраняется.
+func bootstrapNormalize(s string) string {
+	host, port := s, ""
+	if strings.HasPrefix(s, "[") {
+		if idx := strings.Index(s, "]"); idx >= 0 {
+			host = s[1:idx]
+			if idx+1 < len(s) && s[idx+1] == ':' {
+				port = s[idx+2:]
+			}
+		}
+	} else if strings.Contains(s, ".") {
+		if i := strings.LastIndex(s, ":"); i > 0 {
+			host = s[:i]
+			port = s[i+1:]
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return s
+	}
+	canon := ip.String()
+	if port != "" {
+		if strings.Contains(canon, ":") {
+			return "[" + canon + "]:" + port
+		}
+		return canon + ":" + port
+	}
+	return canon
+}
+
+// bootstrapDefaultList — встроенные адреса doqd как срез (для сброса).
+var bootstrapDefaultList = strings.Fields(bootstrapDefault)
+
+// bootstrapGetHandler — GET /bootstrap: массив текущих адресов из doqd.conf,
+// встроенные адреса по умолчанию и признак «используется директива или нет».
 func bootstrapGetHandler(w http.ResponseWriter, r *http.Request) {
+	addrs := bootstrapGet()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"bootstrap": bootstrapGet(),
-		"default":   bootstrapDefault,
+		"servers":   addrs,
+		"effective": effectiveBootstrap(),
+		"custom":    len(addrs) > 0,
+		"default":   bootstrapDefaultList,
 	})
 }
 
-func bootstrapSave(w http.ResponseWriter, r *http.Request) {
-	raw := strings.TrimSpace(r.FormValue("servers"))
-	value, err := bootstrapParseAndValidate(raw)
-	if err != nil {
-		http.Redirect(w, r, "/?msg="+encode("Ошибка: "+err.Error()), 303)
+// bootstrapAdd — POST /bootstrap/add: добавить один адрес к списку.
+func bootstrapAdd(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.FormValue("server"))
+	if raw == "" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустой адрес"), 303)
 		return
 	}
-	if err := setBootstrapDirective(value); err != nil {
+	if !bootstrapIPValid(raw) {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: некорректный IP-адрес "+raw+" (только IP-литералы, опционально :порт)"), 303)
+		return
+	}
+	addr := bootstrapNormalize(raw)
+	addrs := bootstrapGet()
+	// Если директивы нет, за точку отсчёта берём встроенные адреса — иначе
+	// добавление одного адреса молча выключит остальные bootstrap-серверы.
+	base := addrs
+	if len(base) == 0 {
+		base = append([]string(nil), bootstrapDefaultList...)
+	}
+	for _, a := range base {
+		if bootstrapNormalize(a) == addr {
+			http.Redirect(w, r, "/?msg="+encode("Адрес "+addr+" уже в списке"), 303)
+			return
+		}
+	}
+	base = append(base, addr)
+	if err := setBootstrapDirective(base); err != nil {
 		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
 		return
 	}
 	restartOut := controlOutput(run(doqdInitScript, "restart"))
 	requestRefreshAfter(refreshAfterRestart)
-	if value == "" {
-		http.Redirect(w, r, "/?msg="+encode("Bootstrap сброшен на встроенные адреса, демон перезапущен:\n"+restartOut), 303)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap: добавлен "+addr+", демон перезапущен:\n"+restartOut), 303)
+}
+
+// bootstrapRemove — POST /bootstrap/remove: удалить адрес из списка. Удаление
+// последнего адреса снимает директиву целиком (возврат на встроенные).
+func bootstrapRemove(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.FormValue("server"))
+	if raw == "" {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: пустой адрес"), 303)
 		return
 	}
-	http.Redirect(w, r, "/?msg="+encode("Bootstrap обновлён ("+value+"), демон перезапущен:\n"+restartOut), 303)
+	target := bootstrapNormalize(raw)
+	addrs := bootstrapGet()
+	var keep []string
+	found := false
+	for _, a := range addrs {
+		if bootstrapNormalize(a) == target {
+			found = true
+			continue
+		}
+		keep = append(keep, a)
+	}
+	if !found {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка: адрес "+raw+" не найден в директиве bootstrap"), 303)
+		return
+	}
+	if err := setBootstrapDirective(keep); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	if len(keep) == 0 {
+		http.Redirect(w, r, "/?msg="+encode("Bootstrap: адрес "+target+" удалён, директива снята (встроенные адреса), демон перезапущен:\n"+restartOut), 303)
+		return
+	}
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap: удалён "+target+", демон перезапущен:\n"+restartOut), 303)
+}
+
+// bootstrapReset — POST /bootstrap/reset: снять директиву, вернувшись на
+// встроенные адреса doqd.
+func bootstrapReset(w http.ResponseWriter, r *http.Request) {
+	if bootstrapCount() == 0 {
+		http.Redirect(w, r, "/?msg="+encode("Bootstrap уже использует встроенные адреса"), 303)
+		return
+	}
+	if err := setBootstrapDirective(nil); err != nil {
+		http.Redirect(w, r, "/?msg="+encode("Ошибка конфига: "+err.Error()), 303)
+		return
+	}
+	restartOut := controlOutput(run(doqdInitScript, "restart"))
+	requestRefreshAfter(refreshAfterRestart)
+	http.Redirect(w, r, "/?msg="+encode("Bootstrap сброшен на встроенные адреса, демон перезапущен:\n"+restartOut), 303)
 }
 
 // hostsEditMax — потолок размера hosts-файла в редакторе. Встроенный снимок

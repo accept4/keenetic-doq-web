@@ -243,6 +243,27 @@ try {
     margin-bottom: 12px;
     flex-wrap: wrap;
   }
+  .bs-list { min-height: 32px; }
+  .bs-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; margin-bottom: 4px;
+    background: var(--surface2); border-radius: 4px;
+    font-size: 13px; font-family: monospace;
+  }
+  .bs-item span { flex: 1; }
+  .bs-item button {
+    background: none; border: none; color: var(--red);
+    cursor: pointer; font-size: 16px; font-weight: 700;
+    padding: 2px 6px; border-radius: 3px; line-height: 1;
+  }
+  .bs-item button:hover { background: var(--surface2); }
+  .bs-empty { font-size: 12px; color: var(--text2); padding: 8px 0; }
+  .bs-default {
+    padding: 8px 10px; margin-bottom: 8px;
+    background: var(--surface2); border-radius: 4px;
+    font-size: 12px; color: var(--text2);
+  }
+  .bs-default code { font-weight: 600; }
   input[type=text] {
     flex: 1;
     min-width: 220px;
@@ -457,15 +478,23 @@ try {
 
   <!-- Bootstrap DNS -->
   <div class="card">
-    <div class="card-header">Bootstrap — внешний DNS для upstream</div>
+    <div class="card-header">
+      <span>Bootstrap — внешний DNS для upstream</span>
+      <span style="font-size:11px;color:var(--text2)" id="bootstrapMode"></span>
+    </div>
     <div class="card-body">
-      <div class="form-row">
-        <input type="text" id="bootstrapInput" placeholder="77.88.8.8:53 8.8.8.8:53" style="flex:1;min-width:220px;">
-        <button class="btn btn-primary" type="button" id="bootstrapSaveBtn">💾 Сохранить</button>
+      <div id="bootstrapList" class="bs-list">
+        <div class="bs-empty">загрузка…</div>
+      </div>
+      <div class="form-row" style="margin-top:12px;">
+        <input type="text" id="bootstrapInput" placeholder="1.1.1.1:53  или  [2001:4860:4860::8888]:53">
+        <button class="btn btn-green" type="button" id="bootstrapAddBtn">+ Добавить</button>
+        <button class="btn btn-orange" type="button" id="bootstrapResetBtn">↩ Встроенные</button>
       </div>
       <p style="font-size:11px;color:var(--text2);margin-top:10px;">
-        IP-адреса (только IP-литералы, опционально :порт). По умолчанию: встроенные.
-        Нужен для разрешения имён upstream без петли через doqd. На OpenWRT также обходит NTP.
+        Только IP-литералы (опционально :порт, IPv6 в скобках). Адреса берутся из директивы
+        <code>bootstrap</code> в %[9]s; без неё doqd использует встроенные.
+        Нужен для разрешения имён upstream без петли через сам doqd.
       </p>
     </div>
   </div>
@@ -524,34 +553,108 @@ try {
 
 <script>
 (function () {
-  // Bootstrap DNS: чтение и сохранение директивы.
-  var bInput = document.getElementById('bootstrapInput');
-  var bBtn = document.getElementById('bootstrapSaveBtn');
+  // Bootstrap DNS: чтение из doqd.conf, добавление/удаление адреса.
+  // Каждое действие — POST-форма; сервер перезапускает doqd и отвечает
+  // 303 с сообщением, поэтому страница перечитывает список сама.
+  var list = document.getElementById('bootstrapList');
+  var modeEl = document.getElementById('bootstrapMode');
+  var input = document.getElementById('bootstrapInput');
+  var addBtn = document.getElementById('bootstrapAddBtn');
+  var resetBtn = document.getElementById('bootstrapResetBtn');
+  var busy = false;
+
+  // submitForm: создаёт временную форму POST с одним полем и отправляет её.
+  // Только POST — серверные маршруты закрыты onlyPOST.
+  function submitForm(action, name, value) {
+    if (busy) { return false; }
+    busy = true;
+    var f = document.createElement('form');
+    f.method = 'POST';
+    f.action = action;
+    var i = document.createElement('input');
+    i.type = 'hidden';
+    i.name = name;
+    i.value = value;
+    f.appendChild(i);
+    document.body.appendChild(f);
+    f.submit();
+    return true;
+  }
+
+  function renderServers(servers) {
+    // Для каждого адреса — форма с кнопкой удаления.
+    for (var i = 0; i < servers.length; i++) {
+      var row = document.createElement('div');
+      row.className = 'bs-item';
+      var addrSpan = document.createElement('span');
+      addrSpan.textContent = servers[i];
+      var rmBtn = document.createElement('button');
+      rmBtn.type = 'button';
+      rmBtn.textContent = '×';
+      rmBtn.title = 'Удалить ' + servers[i];
+      rmBtn.setAttribute('data-server', servers[i]);
+      rmBtn.addEventListener('click', function () {
+        if (!window.confirm('Удалить bootstrap-адрес ' + this.getAttribute('data-server') + '?\n\nДемон будет перезапущен.')) return;
+        submitForm('/bootstrap/remove', 'server', this.getAttribute('data-server'));
+      });
+      row.appendChild(addrSpan);
+      row.appendChild(rmBtn);
+      list.appendChild(row);
+    }
+  }
+
+  function renderDefault(effective) {
+    var div = document.createElement('div');
+    div.className = 'bs-default';
+    div.textContent = 'Используются встроенные адреса doqd:';
+    list.appendChild(div);
+    renderServers(effective);
+  }
+
   function loadBootstrap() {
     fetch('/bootstrap', {cache: 'no-store'}).then(function (r) {
       if (!r.ok) { throw new Error('http'); }
       return r.json();
     }).then(function (d) {
-      if (bInput && d.bootstrap) {
-        bInput.value = d.bootstrap;
+      if (!list) { return; }
+      list.innerHTML = '';
+      if (modeEl) {
+        modeEl.textContent = d.custom ? 'свой список' : 'встроенные адреса';
+      }
+      if (d.custom && d.servers && d.servers.length) {
+        renderServers(d.servers);
+      } else {
+        renderDefault(d.effective || []);
       }
     }).catch(function () {
-      if (bInput) { bInput.placeholder = 'ошибка загрузки'; }
+      if (list) { list.innerHTML = '<div class="bs-empty">не удалось загрузить</div>'; }
     });
   }
+
   loadBootstrap();
-  if (bBtn) {
-    bBtn.addEventListener('click', function () {
-      if (!window.confirm('Сохранить bootstrap и перезапустить doqd?\n\nДемон будет перезапущен.')) return;
-      var fd = new FormData();
-      fd.set('servers', bInput ? bInput.value.trim() : '');
-      fetch('/bootstrap/save', {method: 'POST', body: fd}).then(function (r) {
-        if (r.redirected) {
-          window.location.href = r.url;
-        }
-      }).catch(function () {
-        window.location.href = '/';
-      });
+
+  if (addBtn) {
+    addBtn.addEventListener('click', function () {
+      if (!input || !input.value.trim()) {
+        if (input) { input.focus(); }
+        return;
+      }
+      var addr = input.value.trim();
+      if (!window.confirm('Добавить bootstrap-адрес ' + addr + '?\n\nДемон будет перезапущен.')) return;
+      submitForm('/bootstrap/add', 'server', addr);
+    });
+  }
+
+  if (resetBtn) {
+    resetBtn.addEventListener('click', function () {
+      if (!window.confirm('Снять директиву bootstrap и вернуться на встроенные адреса doqd?\n\nДемон будет перезапущен.')) return;
+      submitForm('/bootstrap/reset', 'confirm', '1');
+    });
+  }
+
+  if (input) {
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); if (addBtn) addBtn.click(); }
     });
   }
 })();
@@ -824,6 +927,7 @@ func page(w http.ResponseWriter, r *http.Request) {
 		html.EscapeString(list),
 		age,
 		html.EscapeString(customHostsPath),
+		html.EscapeString(doqdConfPath),
 	); err != nil {
 		log.Printf("render: %v", err)
 	}
