@@ -581,24 +581,25 @@ try {
     return true;
   }
 
-  function renderServers(servers) {
-    // Для каждого адреса — форма с кнопкой удаления.
+  function renderServers(servers, removable) {
     for (var i = 0; i < servers.length; i++) {
       var row = document.createElement('div');
       row.className = 'bs-item';
       var addrSpan = document.createElement('span');
       addrSpan.textContent = servers[i];
-      var rmBtn = document.createElement('button');
-      rmBtn.type = 'button';
-      rmBtn.textContent = '×';
-      rmBtn.title = 'Удалить ' + servers[i];
-      rmBtn.setAttribute('data-server', servers[i]);
-      rmBtn.addEventListener('click', function () {
-        if (!window.confirm('Удалить bootstrap-адрес ' + this.getAttribute('data-server') + '?\n\nДемон будет перезапущен.')) return;
-        submitForm('/bootstrap/remove', 'server', this.getAttribute('data-server'));
-      });
       row.appendChild(addrSpan);
-      row.appendChild(rmBtn);
+      if (removable) {
+        var rmBtn = document.createElement('button');
+        rmBtn.type = 'button';
+        rmBtn.textContent = '×';
+        rmBtn.title = 'Удалить ' + servers[i];
+        rmBtn.setAttribute('data-server', servers[i]);
+        rmBtn.addEventListener('click', function () {
+          if (!window.confirm('Удалить bootstrap-адрес ' + this.getAttribute('data-server') + '?\n\nДемон будет перезапущен.')) return;
+          submitForm('/bootstrap/remove', 'server', this.getAttribute('data-server'));
+        });
+        row.appendChild(rmBtn);
+      }
       list.appendChild(row);
     }
   }
@@ -608,7 +609,8 @@ try {
     div.className = 'bs-default';
     div.textContent = 'Используются встроенные адреса doqd:';
     list.appendChild(div);
-    renderServers(effective);
+    // встроенные адреса — только для отображения, удалить нельзя
+    renderServers(effective, false);
   }
 
   function loadBootstrap() {
@@ -622,10 +624,12 @@ try {
         modeEl.textContent = d.custom ? 'свой список' : 'встроенные адреса';
       }
       if (d.custom && d.servers && d.servers.length) {
-        renderServers(d.servers);
+        renderServers(d.servers, true);
       } else {
         renderDefault(d.effective || []);
       }
+      // Сбрасывать нечего, когда директивы нет — скрываем кнопку.
+      if (resetBtn) { resetBtn.style.display = d.custom ? '' : 'none'; }
     }).catch(function () {
       if (list) { list.innerHTML = '<div class="bs-empty">не удалось загрузить</div>'; }
     });

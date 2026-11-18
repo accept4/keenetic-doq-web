@@ -826,6 +826,11 @@ func bootstrapRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	target := bootstrapNormalize(raw)
 	addrs := bootstrapGet()
+	if len(addrs) == 0 {
+		// Директивы нет — удалять нечего: doqd использует встроенные адреса.
+		http.Redirect(w, r, "/?msg="+encode("Bootstrap-директивы нет в конфиге — используются встроенные адреса doqd"), 303)
+		return
+	}
 	var keep []string
 	found := false
 	for _, a := range addrs {
